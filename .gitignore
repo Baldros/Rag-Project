@@ -1,0 +1,5 @@
+# Pastas
+project_venv/
+chroma_db/
+out/
+__pycache__/
