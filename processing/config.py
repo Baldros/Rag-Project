@@ -12,8 +12,6 @@ from pathlib import Path
 # =========================
 # Caminhos
 # =========================
-
-PDF_DIR = Path(r"E:\Estudo\Fisica\Fisica III")
 CHROMA_DIR = Path("./chroma_db")
 
 

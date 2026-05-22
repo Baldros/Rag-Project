@@ -7,7 +7,8 @@ com o comando já usado no terminal.
 """
 
 from processing import index_folder
-from processing.config import PDF_DIR
+from pathlib import Path
 
 if __name__ == "__main__":
+    PDF_DIR = Path(input("Digite o caminho da pasta com os PDFs: "))
     index_folder(PDF_DIR)
