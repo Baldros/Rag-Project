@@ -8,7 +8,7 @@ def get_chat_agent():
     llm = ChatOllama(model="qwen3.5:0.8b")
     
     # O LangChain conecta e mapeia seu SQLite automaticamente
-    db = SQLDatabase.from_uri("sqlite:///chroma.db")
+    db = SQLDatabase.from_uri("sqlite:///chroma_db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     
     # O kit já te dá as ferramentas prontas!
