@@ -3,3 +3,6 @@
 chroma_db/
 out/
 __pycache__/
+
+# variáveis de ambiente
+.env
