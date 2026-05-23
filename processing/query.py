@@ -7,7 +7,9 @@ Pode ser importado de notebooks, scripts, APIs, etc.
 
 from __future__ import annotations
 
+from processing.rag import clean_metadata, retrieval_query
 from processing.storage import create_collection
+from tqdm import tqdm
 
 
 def query_base(query: str, n_results: int = 5) -> None:
@@ -17,10 +19,10 @@ def query_base(query: str, n_results: int = 5) -> None:
     Como a collection foi criada com OllamaEmbeddingFunction,
     o Chroma consegue embedar a query automaticamente.
     """
-    collection, _ = create_collection()
+    collection, _ = create_collection(create=False)
 
     results = collection.query(
-        query_texts=[query],
+        query_texts=[retrieval_query(query)],
         n_results=n_results,
         include=["documents", "metadatas", "distances"],
     )
@@ -29,13 +31,14 @@ def query_base(query: str, n_results: int = 5) -> None:
     metadatas = results.get("metadatas", [[]])[0]
     distances = results.get("distances", [[]])[0]
 
-    for i, (doc, meta, distance) in enumerate(
+    for i, (doc, meta, distance) in tqdm(enumerate(
         zip(documents, metadatas, distances),
         start=1,
-    ):
+    ), desc="Processando resultados..."):
         print("=" * 80)
         print(f"Resultado {i} | distância: {distance}")
-        print(f"Arquivo: {meta.get('filename')}")
-        print(f"Páginas do bloco: {meta.get('page_block_start')} - {meta.get('page_block_end')}")
+        clean_meta = clean_metadata(meta)
+        print(f"Arquivo: {clean_meta.get('filename')}")
+        print(f"Páginas: {clean_meta.get('pages')}")
         print()
         print(doc[:1500])

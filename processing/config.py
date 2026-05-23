@@ -23,6 +23,11 @@ COLLECTION_NAME = "livros_fisica"
 
 OLLAMA_URL = "http://localhost:11434"
 EMBED_MODEL = "embeddinggemma"
+LLM_MODEL = "qwen3.5:0.8b"
+
+RAG_TOP_K = 6
+RAG_MAX_CONTEXT_CHARS = 4500
+LLM_REQUEST_TIMEOUT = 120
 
 
 # =========================

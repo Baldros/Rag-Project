@@ -1,30 +1,70 @@
 """
-Agente conversacional integrado ao ChromaDB via LlamaIndex.
+RAG simples com LlamaIndex LLM + ChromaDB.
+
+O Chroma e consultado como base vetorial persistida; o LLM so recebe
+um contexto curto e limpo.
 """
 
-import chromadb
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import VectorStoreIndex, Settings
-#from llama_index.llms.openai import OpenAI
+from __future__ import annotations
+
+from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
-#from utils import get_env_variables
 
-def get_chat_engine(collection_name="livros_fisica", db_path="./chroma_db"):
-    #api_key, model_name = get_env_variables()
-    
-    #Settings.llm = OpenAI(model=model_name, api_key=api_key)
-    Settings.llm = Ollama(model="qwen3.5:0.8b", base_url="http://localhost:11434")
-    Settings.embed_model = OllamaEmbedding(
-        model_name="embeddinggemma",
-        base_url="http://localhost:11434"
-    )
-    
-    db = chromadb.PersistentClient(path=db_path)
-    chroma_collection = db.get_or_create_collection(collection_name)
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    
-    index = VectorStoreIndex.from_vector_store(vector_store)
-    return index.as_chat_engine(chat_mode="condense_plus_context")
+from processing.config import (
+    LLM_MODEL,
+    LLM_REQUEST_TIMEOUT,
+    OLLAMA_URL,
+    RAG_MAX_CONTEXT_CHARS,
+    RAG_TOP_K,
+)
+from processing.rag import (
+    RAG_SYSTEM_PROMPT,
+    RetrievedChunk,
+    build_user_prompt,
+    finalize_answer,
+    format_context,
+    retrieve_chunks,
+)
 
 
+class SimpleChatResponse:
+    def __init__(self, response: str, source_chunks: list[RetrievedChunk]) -> None:
+        self.response = response
+        self.source_chunks = source_chunks
+
+    def __str__(self) -> str:
+        return self.response
+
+
+class LlamaRAGChatEngine:
+    def __init__(self, *, top_k: int = RAG_TOP_K) -> None:
+        self.top_k = top_k
+        self.llm = Ollama(
+            model=LLM_MODEL,
+            base_url=OLLAMA_URL,
+            request_timeout=LLM_REQUEST_TIMEOUT,
+            temperature=0,
+            context_window=4096,
+            thinking=False,
+            keep_alive="5m",
+        )
+
+    def chat(self, message: str) -> SimpleChatResponse:
+        chunks = retrieve_chunks(message, n_results=self.top_k)
+        context = format_context(chunks, max_chars=RAG_MAX_CONTEXT_CHARS)
+        response = self.llm.chat(
+            [
+                ChatMessage(role=MessageRole.SYSTEM, content=RAG_SYSTEM_PROMPT),
+                ChatMessage(
+                    role=MessageRole.USER,
+                    content=build_user_prompt(message, context),
+                ),
+            ]
+        )
+
+        answer = finalize_answer(response.message.content or "", message, chunks)
+        return SimpleChatResponse(answer, chunks)
+
+
+def get_chat_engine(top_k: int = RAG_TOP_K):
+    return LlamaRAGChatEngine(top_k=top_k)

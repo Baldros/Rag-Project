@@ -27,10 +27,13 @@ from processing.utils import batched
 logger = logging.getLogger(__name__)
 
 
-def create_collection():
+def create_collection(*, create: bool = True):
     """
     Cria ou recupera coleção persistente do Chroma
     com a embedding function do Ollama já configurada.
+
+    Para consulta, use create=False para falhar cedo caso a collection
+    persistida não exista, em vez de criar uma collection vazia sem querer.
     """
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 
@@ -39,14 +42,20 @@ def create_collection():
         model_name=EMBED_MODEL,
     )
 
-    collection = chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=ollama_ef,
-        metadata={
-            "description": "Base vetorial de livros processados com Docling + Ollama",
-            "embedding_model": EMBED_MODEL,
-        },
-    )
+    if create:
+        collection = chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=ollama_ef,
+            metadata={
+                "description": "Base vetorial de livros processados com Docling + Ollama",
+                "embedding_model": EMBED_MODEL,
+            },
+        )
+    else:
+        collection = chroma_client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=ollama_ef,
+        )
 
     return collection, ollama_ef
 
