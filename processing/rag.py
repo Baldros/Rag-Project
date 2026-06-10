@@ -11,14 +11,14 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 from processing.config import RAG_MAX_CONTEXT_CHARS, RAG_TOP_K
 from processing.storage import create_collection
 
 
-class AnswerMode(StrEnum):
+class AnswerMode(str, Enum):
     """Controls how much the assistant should develop the answer."""
 
     OBJECTIVE = "objective"
