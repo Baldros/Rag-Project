@@ -1,7 +1,8 @@
 """
-RAG simples com LangChain + ChromaDB.
+Simple RAG agent with LangChain + ChromaDB.
 
-O Chroma e usado como base vetorial, nao como SQLite relacional.
+Chroma is used as a vector base, and the LLM receives a clean, grounded context
+with response-mode-aware instructions.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from processing.config import (
+    LLM_CONTEXT_WINDOW,
+    LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_REQUEST_TIMEOUT,
     OLLAMA_URL,
@@ -18,9 +21,11 @@ from processing.config import (
 )
 from processing.rag import (
     RAG_SYSTEM_PROMPT,
+    AnswerMode,
     build_user_prompt,
     finalize_answer,
     format_context,
+    infer_answer_mode,
     retrieve_chunks,
 )
 
@@ -33,21 +38,22 @@ class LangChainRAGAgent:
             base_url=OLLAMA_URL,
             reasoning=False,
             temperature=0,
-            num_ctx=4096,
-            num_predict=512,
+            num_ctx=LLM_CONTEXT_WINDOW,
+            num_predict=LLM_MAX_TOKENS,
             keep_alive="5m",
             sync_client_kwargs={"timeout": LLM_REQUEST_TIMEOUT},
         )
 
     def invoke(self, payload: dict) -> dict:
         question = _latest_user_message(payload)
+        answer_mode = _answer_mode(payload, question)
         chunks = retrieve_chunks(question, n_results=self.top_k)
         context = format_context(chunks, max_chars=RAG_MAX_CONTEXT_CHARS)
 
         response = self.llm.invoke(
             [
                 SystemMessage(content=RAG_SYSTEM_PROMPT),
-                HumanMessage(content=build_user_prompt(question, context)),
+                HumanMessage(content=build_user_prompt(question, context, answer_mode=answer_mode)),
             ]
         )
         answer = finalize_answer(response.content, question, chunks)
@@ -69,7 +75,14 @@ def _latest_user_message(payload: dict) -> str:
     if text:
         return str(text).strip()
 
-    raise ValueError("Nenhuma mensagem de usuario encontrada para consultar o RAG.")
+    raise ValueError("No user message found for the RAG query.")
+
+
+def _answer_mode(payload: dict, question: str) -> AnswerMode:
+    requested_mode = payload.get("answer_mode") or payload.get("mode")
+    if requested_mode:
+        return AnswerMode(str(requested_mode))
+    return infer_answer_mode(question)
 
 
 def get_chat_agent():
