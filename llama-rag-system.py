@@ -1,8 +1,8 @@
 """
-RAG simples com LlamaIndex LLM + ChromaDB.
+Simple RAG chat engine with LlamaIndex LLM + ChromaDB.
 
-O Chroma e consultado como base vetorial persistida; o LLM so recebe
-um contexto curto e limpo.
+Chroma is queried as the persisted vector base; the LLM receives a clean,
+grounded context and a response-mode-aware prompt.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
 
 from processing.config import (
+    LLM_CONTEXT_WINDOW,
     LLM_MODEL,
     LLM_REQUEST_TIMEOUT,
     OLLAMA_URL,
@@ -19,10 +20,12 @@ from processing.config import (
 )
 from processing.rag import (
     RAG_SYSTEM_PROMPT,
+    AnswerMode,
     RetrievedChunk,
     build_user_prompt,
     finalize_answer,
     format_context,
+    infer_answer_mode,
     retrieve_chunks,
 )
 
@@ -44,12 +47,17 @@ class LlamaRAGChatEngine:
             base_url=OLLAMA_URL,
             request_timeout=LLM_REQUEST_TIMEOUT,
             temperature=0,
-            context_window=4096,
+            context_window=LLM_CONTEXT_WINDOW,
             thinking=False,
             keep_alive="5m",
         )
 
-    def chat(self, message: str) -> SimpleChatResponse:
+    def chat(
+        self,
+        message: str,
+        answer_mode: AnswerMode | str | None = None,
+    ) -> SimpleChatResponse:
+        mode = AnswerMode(answer_mode) if answer_mode else infer_answer_mode(message)
         chunks = retrieve_chunks(message, n_results=self.top_k)
         context = format_context(chunks, max_chars=RAG_MAX_CONTEXT_CHARS)
         response = self.llm.chat(
@@ -57,7 +65,7 @@ class LlamaRAGChatEngine:
                 ChatMessage(role=MessageRole.SYSTEM, content=RAG_SYSTEM_PROMPT),
                 ChatMessage(
                     role=MessageRole.USER,
-                    content=build_user_prompt(message, context),
+                    content=build_user_prompt(message, context, answer_mode=mode),
                 ),
             ]
         )
