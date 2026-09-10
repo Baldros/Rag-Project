@@ -1,8 +1,16 @@
-# Pastas
+# Ambiente
 .venv*/
+__pycache__/
+*.pyc
+
+# Dados da base — NUNCA versionar.
+# O repositório é público e `store/` contém o texto integral dos documentos
+# indexados, que costumam ter direitos autorais. Também é reconstruível:
+# artefatos vêm dos PDFs, e o índice vetorial vem do SQLite.
+store/
 chroma_db/
 out/
-__pycache__/
+.testdata/
 
-# variáveis de ambiente
+# Variáveis de ambiente
 .env

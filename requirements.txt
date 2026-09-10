@@ -1,29 +1,21 @@
-# Dependências principais para o pipeline de RAG (Docling + ChromaDB + Ollama)
-# O torch, devido a complicações, será sempre instalado manualmente. cuda12.x
+# Knowledge base — ETL e retrieval para agentes (via MCP)
+#
+# torch é instalado manualmente por causa do CUDA. Nesta máquina:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
 
-# Dependências de processamento de documentos
-docling>=2.93.0
+# Parsing de documentos
+docling>=2.95.0
 pypdf>=6.11.0
 
-# SGBD:
-chromadb>=1.5.0
+# Persistência
+chromadb>=1.5.0          # índice vetorial (camada descartável)
+# SQLite + FTS5 vêm da stdlib: estrutura, BM25 e jobs
 
-# Utils
-tqdm>=4.67.0
+# Modelos de recuperação (rodam localmente na GPU, via torch)
+sentence-transformers>=6.0.0   # bge-m3 (embedding) e bge-reranker-v2-m3 (rerank)
 
-# Dependência de gerenciamento de variáveis de ambiente
-python-dotenv
+# Superfície de contato
+mcp>=2.2.0
 
-# Estrutura Langchain
-langchain
-langgraph
-langchain-ollama
-langchain-openai
-langchain-xai
-langchain-community
-
-# Estrutura LlamaIndex
-llama-index
-llama-index-llms-ollama
-llama-index-embeddings-ollama
-llama-index-vector-stores-chroma
+# Sem LLM local: a geração é responsabilidade do agente que consome o MCP.
+# Por isso não há mais langchain, llama-index nem ollama aqui.
