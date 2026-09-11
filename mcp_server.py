@@ -51,8 +51,8 @@ async def lifespan(_server: MCPServer):
 
     Sobe: dispara o carregamento em background, para o handshake responder na
     hora enquanto os ~150s de import e carga correm em paralelo com a
-    inicialização do cliente. Uma busca que chegue antes do fim simplesmente
-    espera no mesmo lock, em vez de disparar uma segunda carga.
+    inicialização do cliente. Uma busca que chegue antes do fim não espera — a
+    tool devolve `warming_up` na hora, e o agente repete depois.
 
     Cai: devolve a VRAM explicitamente, sem depender do fim do processo.
     """
@@ -132,7 +132,25 @@ def search(
         de títulos até a seção.
     """
     from kb.jobs import active_jobs
+    from kb.models import readiness
     from kb.retrieval import search as run_search
+
+    # Durante o aquecimento, responder é melhor que pendurar: uma chamada que
+    # não volta por ~90s vira timeout no cliente e chega ao agente como erro,
+    # em vez de como espera.
+    state = readiness()
+    if state["warming_up"]:
+        return {
+            "warming_up": True,
+            "elapsed_s": state.get("elapsed_s"),
+            "note": (
+                "Os modelos de busca ainda estão carregando (leva cerca de 90s "
+                "após subir o servidor). Nenhuma busca foi executada. Tente de "
+                "novo em instantes; use `status` para conferir a prontidão. As "
+                "tools que não dependem de modelo (list_collections, "
+                "list_documents, get_outline, fetch) já funcionam."
+            ),
+        }
 
     results = run_search(
         query,

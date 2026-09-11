@@ -144,12 +144,35 @@ def status(
 
     from kb.collection import list_all
     from kb.jobs import list_jobs
-    from kb.models import models_info, vram_info
+    from kb.models import models_info, readiness, vram_info
+
+    ready = readiness()
 
     report: dict[str, Any] = {
+        # Primeiro campo de propósito: é a pergunta que mais importa logo depois
+        # de subir o servidor — "já posso buscar?".
+        "retrieval": {
+            **ready,
+            "hint": (
+                None
+                if ready["ready"]
+                else "modelos ainda carregando; `search` responderá com warming_up até ficarem prontos"
+                if ready["warming_up"]
+                else "modelos não carregados; a primeira busca vai carregá-los sob demanda"
+            ),
+        },
         "counts": counts(conn),
         "chunks": chunk_stats(conn),
-        "consistency": consistency(conn),
+        # A checagem de consistência importa o chromadb, e durante o aquecimento
+        # esse import fica serializado atrás do `import torch` da thread de
+        # warmup — o lock de import do Python é global. Pular aqui é o que faz
+        # `status` responder na hora justamente quando é mais útil: para saber
+        # se já dá para buscar.
+        "consistency": (
+            {"deferred": "checagem adiada durante o aquecimento dos modelos"}
+            if ready["warming_up"]
+            else consistency(conn)
+        ),
         "models": {
             "embedding": EMBED_MODEL,
             "reranker": RERANK_MODEL if RERANK_ENABLED else None,
@@ -213,9 +236,10 @@ def _warnings(report: dict[str, Any]) -> list[str]:
     messages: list[str] = []
     counts_ = report["counts"]
 
-    if not report["consistency"]["ok"]:
+    consistency_ = report["consistency"]
+    if not consistency_.get("deferred") and not consistency_.get("ok"):
         messages.append(
-            f"índice vetorial fora de sincronia ({report['consistency'].get('hint', '')})"
+            f"índice vetorial fora de sincronia ({consistency_.get('hint', '')})"
         )
 
     if counts_["pending_embed"]:

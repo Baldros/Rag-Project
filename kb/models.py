@@ -1,13 +1,17 @@
 """
 Gerência de modelos e de VRAM.
 
-Regra do projeto: um modelo por vez na GPU. Aqui isso vira carga preguiçosa
-(nada sobe até ser usado) mais descarga por inatividade (o que subiu desce
-sozinho). Numa ingestão longa e desatendida, a pilha de retrieval já se
-descarregou antes do worker precisar da GPU.
+Só modelos de **recuperação** vivem aqui — embedding e rerank. O LLM da
+ingestão é outro sistema e mora em `kb/llm.py`.
 
-O LLM não aparece em lugar nenhum: geração é responsabilidade do agente que
-consome o MCP. Aqui só existem modelos de recuperação.
+O ciclo de vida é o do servidor MCP: `preload()` no startup, `unload_all()` no
+shutdown. Descarga por ociosidade existe mas vem desligada
+(`MODEL_IDLE_TIMEOUT=0`), porque nesta máquina recarregar custa os ~150s de
+import do torch e não compraria VRAM que esteja em disputa.
+
+`readiness()` e `ModelSlot.info()` são deliberadamente livres de lock: quem os
+chama está tentando descobrir se a carga terminou, e não pode ficar preso atrás
+dela para saber.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from kb.config import (
     DEVICE,
     EMBED_MODEL,
     MODEL_IDLE_TIMEOUT,
+    RERANK_ENABLED,
     RERANK_MAX_LENGTH,
     RERANK_MODEL,
     TORCH_DTYPE,
@@ -118,13 +123,23 @@ class ModelSlot:
         return self.unload()
 
     def info(self) -> dict[str, Any]:
-        with self._lock:
-            idle = time.monotonic() - self._last_used if self._model else None
-            return {
-                "name": self.name,
-                "loaded": self._model is not None,
-                "idle_seconds": round(idle, 1) if idle is not None else None,
-            }
+        """
+        Estado do slot, **sem** pegar o lock.
+
+        De propósito: o lock fica retido durante a carga inteira, que aqui leva
+        dezenas de segundos. Se este método esperasse por ele, a única tool capaz
+        de responder "já está pronto?" ficaria presa exatamente enquanto a
+        resposta seria "ainda não". Ler uma referência é atômico o bastante para
+        um relatório de estado.
+        """
+        model = self._model
+        idle = time.monotonic() - self._last_used if model is not None else None
+
+        return {
+            "name": self.name,
+            "loaded": model is not None,
+            "idle_seconds": round(idle, 1) if idle is not None else None,
+        }
 
 
 def _load_embedder():
@@ -231,6 +246,12 @@ def rerank(query: str, documents: list[str]) -> list[float]:
     return [float(score) for score in scores]
 
 
+# Estado do aquecimento, escrito pela thread de warmup e lido pelas tools.
+# Chaves independentes e escritas atômicas: não precisa de lock, e não pode
+# precisar — quem lê está justamente tentando descobrir se a carga terminou.
+_warmup: dict[str, Any] = {"started_at": None, "finished_at": None, "error": None}
+
+
 def preload(rerank: bool = True) -> dict[str, float]:
     """
     Sobe os modelos de recuperação de uma vez.
@@ -238,22 +259,63 @@ def preload(rerank: bool = True) -> dict[str, float]:
     Chamado no startup do servidor MCP, em thread de background. Nesta máquina o
     custo é dominado pelos imports (`import torch` e `sentence_transformers`
     somam ~150s), não pela leitura dos pesos — e esse custo é por processo, não
-    por modelo. Pagá-lo no startup, enquanto o cliente ainda negocia o
-    protocolo, é o que evita que a primeira busca do agente estoure o timeout.
+    por modelo. Pagá-lo no startup sobrepõe a espera à inicialização do cliente
+    em vez de despejá-la na primeira busca.
     """
     timings: dict[str, float] = {}
 
-    started = time.perf_counter()
-    EMBEDDER.get()
-    timings["embedder"] = round(time.perf_counter() - started, 1)
+    _warmup["started_at"] = time.monotonic()
+    _warmup["finished_at"] = None
+    _warmup["error"] = None
 
-    if rerank:
+    try:
         started = time.perf_counter()
-        RERANKER.get()
-        timings["reranker"] = round(time.perf_counter() - started, 1)
+        EMBEDDER.get()
+        timings["embedder"] = round(time.perf_counter() - started, 1)
+
+        if rerank:
+            started = time.perf_counter()
+            RERANKER.get()
+            timings["reranker"] = round(time.perf_counter() - started, 1)
+    except Exception as exc:
+        _warmup["error"] = str(exc)
+        raise
+    finally:
+        _warmup["finished_at"] = time.monotonic()
 
     logger.info("Modelos prontos: %s", timings)
     return timings
+
+
+def readiness() -> dict[str, Any]:
+    """
+    Se a busca pode ser atendida agora, sem bloquear para descobrir.
+
+    `warming_up` distingue "ainda carregando" de "nunca começou": no primeiro
+    caso vale esperar e repetir, no segundo a carga sob demanda vai acontecer na
+    própria chamada.
+    """
+    ready = EMBEDDER.loaded and (RERANKER.loaded or not RERANK_ENABLED)
+
+    started = _warmup["started_at"]
+    finished = _warmup["finished_at"]
+    warming = started is not None and finished is None and not ready
+
+    state: dict[str, Any] = {
+        "ready": ready,
+        "warming_up": warming,
+        "embedder_loaded": EMBEDDER.loaded,
+        "reranker_loaded": RERANKER.loaded,
+    }
+
+    if started is not None:
+        end = finished if finished is not None else time.monotonic()
+        state["elapsed_s"] = round(end - started, 1)
+
+    if _warmup["error"]:
+        state["error"] = _warmup["error"]
+
+    return state
 
 
 def unload_all() -> list[str]:
