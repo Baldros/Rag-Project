@@ -63,10 +63,35 @@ RERANK_MAX_LENGTH = 1024
 DEVICE = os.getenv("KB_DEVICE", "cuda")
 TORCH_DTYPE = os.getenv("KB_DTYPE", "float16")
 
-# Descarrega modelo ocioso para liberar VRAM. Durante uma ingestão longa e
-# desatendida a pilha de retrieval se descarrega sozinha, então na prática só um
-# modelo fica residente na GPU.
-MODEL_IDLE_TIMEOUT = int(os.getenv("KB_MODEL_IDLE_TIMEOUT", "600"))
+# O ciclo de vida dos modelos é o do servidor: sobem no startup e caem no
+# shutdown. Descarregar por ociosidade sairia caro — nesta máquina o custo de
+# subir de novo é dominado pelos ~150s de `import torch` + `sentence_transformers`,
+# não pela leitura dos pesos — e não compraria nada: a pilha de retrieval ocupa
+# 2,2 GB e não disputa VRAM com mais nada. 0 desliga.
+MODEL_IDLE_TIMEOUT = int(os.getenv("KB_MODEL_IDLE_TIMEOUT", "0"))
+
+
+# =========================
+# LLM de ingestao (Pass 3)
+# =========================
+
+# Usado somente para processamento de texto na ingestao: resumir documento e
+# secao. Nao precisa de tool calling nem de contexto longo. Roda sozinho na GPU,
+# depois que o Docling e o embedder ja sairam.
+#
+# O modelo em si ainda nao foi escolhido a serio — merece uma sessao de teste
+# comparativa. qwen3:8b e o ponto de partida; trocar e uma linha.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+LLM_MODEL = os.getenv("KB_LLM_MODEL", "qwen3:8b")
+LLM_ENABLED = os.getenv("KB_LLM", "1") != "0"
+LLM_TEMPERATURE = float(os.getenv("KB_LLM_TEMPERATURE", "0.2"))
+LLM_NUM_CTX = int(os.getenv("KB_LLM_NUM_CTX", "8192"))
+LLM_REQUEST_TIMEOUT = float(os.getenv("KB_LLM_TIMEOUT", "180"))
+
+# Resumo por secao multiplica o custo por centenas. O de documento e barato e
+# alimenta o catalogo, entao vem ligado; o de secao fica opcional.
+ENRICH_SECTIONS = os.getenv("KB_ENRICH_SECTIONS", "0") != "0"
+ENRICH_MIN_SECTION_CHARS = int(os.getenv("KB_ENRICH_MIN_SECTION_CHARS", "1500"))
 
 
 # =========================

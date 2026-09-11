@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--collection", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--no-enrich", action="store_true")
     parser.add_argument("paths", nargs="+")
 
     args = parser.parse_args(argv)
@@ -70,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             collection_id=args.collection,
             on_progress=on_progress,
             force=args.force,
+            enrich=not args.no_enrich,
             conn=conn,
         )
 

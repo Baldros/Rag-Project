@@ -17,5 +17,10 @@ sentence-transformers>=6.0.0   # bge-m3 (embedding) e bge-reranker-v2-m3 (rerank
 # Superfície de contato
 mcp>=2.2.0
 
-# Sem LLM local: a geração é responsabilidade do agente que consome o MCP.
-# Por isso não há mais langchain, llama-index nem ollama aqui.
+# O LLM do Pass 3 (resumos) fala com o Ollama por HTTP, usando o httpx que já
+# vem com o mcp — nenhum pacote a mais. O Ollama em si é um serviço externo:
+#   ollama pull qwen3:8b
+# Sem ele a ingestão conclui os Passes 1 e 2 e deixa os resumos pendentes.
+#
+# Não há langchain nem llama-index: a geração de resposta é do agente que
+# consome o MCP, e o resumo é do LLM local.

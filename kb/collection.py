@@ -246,6 +246,62 @@ def resolve_scope(
     return sorted(set(resolved))
 
 
+def delete_document(
+    doc_id: str,
+    purge_artifacts: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """
+    Remove um documento da base inteira.
+
+    Diferente de `remove_documents`, que só desfaz a associação com uma
+    collection e deixa o documento vivo — ainda aparecendo em busca sem escopo.
+    Aqui somem as linhas (sections e chunks caem por CASCADE, e os triggers do
+    FTS5 acompanham) e os vetores.
+
+    `purge_artifacts` também apaga o resultado do parse em disco. Por padrão ele
+    fica: é a parte cara de reconstruir, e mantê-lo torna uma reingestão futura
+    quase instantânea.
+    """
+    conn = conn or get_conn()
+
+    row = conn.execute(
+        "SELECT filename, n_chunks FROM documents WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchone()
+
+    if not row:
+        return {"ok": False, "error": f"documento não encontrado: {doc_id}"}
+
+    with transaction(conn):
+        conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+
+    from kb.vectors import get_index
+
+    get_index().delete_docs([doc_id])
+
+    artifacts_removed = False
+    if purge_artifacts:
+        import shutil
+
+        from kb.ingest.parse import artifact_dir
+
+        target = artifact_dir(doc_id)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+            artifacts_removed = True
+
+    logger.info("Documento removido: %s (%s chunks)", row["filename"], row["n_chunks"])
+
+    return {
+        "ok": True,
+        "doc_id": doc_id,
+        "filename": row["filename"],
+        "chunks_removed": row["n_chunks"],
+        "artifacts_removed": artifacts_removed,
+    }
+
+
 def documents_in(
     collection_id: str | None = None,
     conn: sqlite3.Connection | None = None,

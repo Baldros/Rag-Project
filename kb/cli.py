@@ -47,6 +47,7 @@ def cmd_ingest(args) -> int:
         collection_id=args.collection,
         on_progress=on_progress,
         force=args.force,
+        enrich=not args.no_enrich,
     )
     result["elapsed_s"] = round(time.perf_counter() - started, 1)
 
@@ -159,6 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collection-name", help="nome legível, se for criar")
     p.add_argument("--force", action="store_true", help="reprocessa mesmo se já indexado")
     p.add_argument("--background", action="store_true", help="dispara subprocesso e retorna")
+    p.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="pula o Pass 3 (resumos com LLM local)",
+    )
     p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("search", help="busca híbrida")

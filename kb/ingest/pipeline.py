@@ -166,9 +166,18 @@ def ingest_paths(
     collection_id: str | None = None,
     on_progress: ProgressFn | None = None,
     force: bool = False,
+    enrich: bool = True,
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
-    """Executa a ingestão completa e devolve o resumo do que aconteceu."""
+    """
+    Executa a ingestão completa e devolve o resumo do que aconteceu.
+
+    Três passes sequenciais, um modelo por vez na GPU — Docling, depois o
+    embedder, depois o LLM. Cada um descarrega antes do próximo.
+
+    Não depende de agente nem do servidor MCP: esta função é o sistema de
+    ingestão, e o CLI e a tool `ingest` são apenas duas formas de chamá-la.
+    """
     conn = conn or get_conn()
     files = expand_paths(paths)
 
@@ -245,11 +254,25 @@ def ingest_paths(
         release_chunker()
 
     # ---------- Pass 2: bge-m3 ----------
+    # `embed_pending` descarrega o embedder ao terminar, liberando a GPU para o
+    # LLM do Pass 3.
     if touched:
         result["n_embedded"] = embed_pending(
             doc_ids=touched,
             on_progress=lambda done, total, msg: (
                 on_progress("embed", done, total, msg) if on_progress else None
+            ),
+            conn=conn,
+        )
+
+    # ---------- Pass 3: LLM local ----------
+    if touched and enrich:
+        from kb.enrich import run_pass
+
+        result["enrichment"] = run_pass(
+            doc_ids=touched,
+            on_progress=lambda done, total, msg: (
+                on_progress("enrich", done, total, msg) if on_progress else None
             ),
             conn=conn,
         )

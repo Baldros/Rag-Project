@@ -231,8 +231,37 @@ def rerank(query: str, documents: list[str]) -> list[float]:
     return [float(score) for score in scores]
 
 
+def preload(rerank: bool = True) -> dict[str, float]:
+    """
+    Sobe os modelos de recuperação de uma vez.
+
+    Chamado no startup do servidor MCP, em thread de background. Nesta máquina o
+    custo é dominado pelos imports (`import torch` e `sentence_transformers`
+    somam ~150s), não pela leitura dos pesos — e esse custo é por processo, não
+    por modelo. Pagá-lo no startup, enquanto o cliente ainda negocia o
+    protocolo, é o que evita que a primeira busca do agente estoure o timeout.
+    """
+    timings: dict[str, float] = {}
+
+    started = time.perf_counter()
+    EMBEDDER.get()
+    timings["embedder"] = round(time.perf_counter() - started, 1)
+
+    if rerank:
+        started = time.perf_counter()
+        RERANKER.get()
+        timings["reranker"] = round(time.perf_counter() - started, 1)
+
+    logger.info("Modelos prontos: %s", timings)
+    return timings
+
+
 def unload_all() -> list[str]:
-    """Descarrega tudo. Usado ao fim de um pass de ingestão."""
+    """
+    Descarrega tudo e devolve a VRAM.
+
+    Usado no shutdown do servidor e ao fim de um pass de ingestão.
+    """
     return [slot.name for slot in _SLOTS if slot.unload()]
 
 

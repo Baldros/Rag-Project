@@ -120,6 +120,40 @@ def get_job(job_id: str, conn=None) -> dict[str, Any] | None:
     return job
 
 
+def active_jobs(
+    collection_ids: Sequence[str] | None = None,
+    conn=None,
+) -> list[dict[str, Any]]:
+    """
+    Jobs de ingestão ainda em andamento, opcionalmente filtrados por collection.
+
+    Existe para a busca poder avisar quando o escopo consultado está sendo
+    ingerido naquele momento: os resultados sairiam parciais — só os chunks já
+    embedados — e o agente não teria como perceber.
+    """
+    conn = conn or get_conn()
+
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at"
+    ).fetchall()
+
+    active: list[dict[str, Any]] = []
+
+    for row in rows:
+        job = dict(row)
+
+        # Um job cujo processo sumiu não está mais em andamento.
+        if job["status"] == "running" and not _pid_alive(job.get("pid")):
+            continue
+
+        if collection_ids and job["collection_id"] not in collection_ids:
+            continue
+
+        active.append(job)
+
+    return active
+
+
 def list_jobs(limit: int = 10, conn=None) -> list[dict[str, Any]]:
     conn = conn or get_conn()
     rows = conn.execute(
@@ -177,6 +211,7 @@ def spawn_ingest(
     paths: Sequence[str | Path],
     collection_id: str | None = None,
     force: bool = False,
+    enrich: bool = True,
     conn=None,
 ) -> dict[str, Any]:
     """
@@ -263,6 +298,7 @@ def spawn_ingest(
         job_id,
         *(["--collection", collection_id] if collection_id else []),
         *(["--force"] if force else []),
+        *([] if enrich else ["--no-enrich"]),
         "--",
         *[str(path) for path in worker_paths],
     ]

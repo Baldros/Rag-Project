@@ -5,11 +5,32 @@ estrutura real (documento → seções → chunks) e expõe busca híbrida como
 **servidor MCP**, para que qualquer agente — Claude Code, Codex, scripts
 próprios — consulte a base sem saber nada de Docling, embeddings ou vetores.
 
-Não há LLM nesta máquina. Recuperação roda local na GPU; a geração é do agente.
+## Dois sistemas independentes
 
-## Arquitetura
+Esta é a distinção que organiza o projeto inteiro:
 
-Três camadas, com papéis separados de propósito:
+| | **Ingestão** | **Retrieval** |
+|---|---|---|
+| O que faz | PDF → base de conhecimento | base → passagens citáveis |
+| Modelos | Docling → bge-m3 → LLM local | bge-m3 + reranker |
+| Superfície | **CLI** | **MCP** |
+| Depende de agente? | **nunca** | sim, o agente é o consumidor |
+| VRAM | um modelo por vez, sequencial | os dois residentes, ~2,2 GB |
+
+**A ingestão é completa em si.** Roda por linha de comando, sem servidor MCP no
+ar e sem nenhum agente conectado, e produz a base pronta — inclusive os resumos,
+feitos por um LLM local. Nada nela depende da camada de consumo.
+
+**O MCP é onde o retrieval acontece**, e é só isso que ele precisa ser. Ele
+também expõe uma tool `ingest`, mas por conveniência: o agente dispara o mesmo
+processo que você dispararia no terminal, sem gastar contexto lendo o
+repositório para descobrir como. Capacidade nenhuma nova, só previsibilidade.
+
+A ordem de uso é sequencial: primeiro o material entra e é processado; só então
+a base está disponível para consulta. Uma busca feita enquanto a ingestão daquele
+escopo ainda roda volta marcada com `incomplete: true`.
+
+## Arquitetura de armazenamento
 
 ```
 store/
@@ -24,23 +45,20 @@ store/
 ```
 
 O índice vetorial é deliberadamente burro: guarda `chunk_id`, vetor e `doc_id`.
-Todo escopo (collections, filtros) é resolvido no SQLite **antes** da busca
-vetorial. É isso que permite trocar o Chroma por outro backend sem tocar no
-retrieval, e que faz um documento pertencer a várias collections sem duplicar
-nada.
+Todo escopo é resolvido no SQLite **antes** da busca vetorial. É isso que permite
+trocar o Chroma por outro backend sem tocar no retrieval, e que faz um documento
+pertencer a várias collections sem duplicar nada.
 
-### Small-to-big
+**Small-to-big:** recupera-se pelo chunk (~500 tokens, preciso para achar) e
+entrega-se a seção-pai (grande e coerente, adequada para raciocinar).
 
-Recupera-se pelo **chunk** (~500 tokens, preciso para achar) e entrega-se a
-**seção-pai** (grande e coerente, adequada para raciocinar). A fragmentação que
-torna RAG inútil em livro-texto some sem custo extra de indexação.
-
-## Os dois pipelines
+## Os pipelines
 
 ```
-INGESTÃO  (subprocesso, um modelo por vez na VRAM, retomável)
-  Pass 1  PARSE   Docling  → artifacts/          descarrega ao fim
-  Pass 2  EMBED   bge-m3   → índice vetorial     descarrega ao fim
+INGESTÃO  (CLI ou subprocesso; um modelo por vez, retomável)
+  Pass 1  PARSE    Docling   → artifacts/          descarrega
+  Pass 2  EMBED    bge-m3    → índice vetorial     descarrega
+  Pass 3  ENRICH   LLM local → resumos no SQLite   descarrega
 
 RETRIEVAL (no servidor MCP, por query)
   1. Escopo    collections → doc_ids             SQLite       sem modelo
@@ -52,20 +70,23 @@ RETRIEVAL (no servidor MCP, por query)
   6. Citação   {arquivo, títulos, páginas}       SQLite       sem modelo
 ```
 
-A ingestão roda em **processo separado** porque o Docling carrega modelos de
-layout na GPU: no mesmo processo, disputaria VRAM com o embedder e o reranker.
-Ao terminar, o processo morre e a GPU volta limpa por construção.
+Cada pass da ingestão carrega seu modelo, faz todo o trabalho do lote e
+descarrega antes do próximo — nunca dois na GPU ao mesmo tempo. No retrieval os
+dois modelos são pequenos e coexistem sem disputa.
 
 ## Modelos
 
-| Papel | Modelo | VRAM (fp16) | Quando |
+| Papel | Modelo | VRAM | Quando |
 |---|---|---|---|
-| Parse | Docling (layout + TableFormer) | ~1–2 GB | subprocesso, Pass 1 |
+| Parse | Docling (layout + TableFormer) | ~1–2 GB | ingestão, Pass 1 |
 | Embedding | `BAAI/bge-m3` — 1024d, 8192 ctx | ~1,2 GB | Pass 2 e query |
+| Resumo | `qwen3:8b` via Ollama | ~5 GB | ingestão, Pass 3 |
 | Rerank | `BAAI/bge-reranker-v2-m3` | ~1,2 GB | query |
 
-O servidor carrega modelo sob demanda e descarrega por inatividade
-(`KB_MODEL_IDLE_TIMEOUT`, padrão 600 s).
+O LLM faz apenas processamento de texto — não precisa de tool calling nem de
+contexto longo. A escolha ainda não está fechada; `KB_LLM_MODEL` troca em uma
+linha. No servidor MCP, embedding e reranker sobem no startup e caem no
+shutdown.
 
 ## Instalação
 
@@ -73,52 +94,45 @@ O servidor carrega modelo sob demanda e descarrega por inatividade
 python -m venv .venv && .venv/Scripts/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
+ollama pull qwen3:8b
 ```
 
-Os modelos baixam sozinhos no primeiro uso (~6 GB em `~/.cache/huggingface`).
+Os modelos de recuperação baixam sozinhos no primeiro uso (~6 GB em
+`~/.cache/huggingface`). O Ollama é um serviço externo, necessário só para o
+Pass 3: sem ele a ingestão conclui os Passes 1 e 2 e deixa os resumos pendentes,
+sem falhar.
 
-## Uso — CLI
+## Uso — CLI (o sistema de ingestão)
 
 ```bash
 python -m kb.cli ingest "E:/Estudo/Fisica" --collection fisica-3
+python -m kb.cli ingest <pdf> --collection x --no-enrich   # sem o Pass 3
 python -m kb.cli search "campo elétrico de um dipolo" --collection fisica-3
 python -m kb.cli status
-python -m kb.cli collections
-python -m kb.cli outline <doc_id>
 python -m kb.cli reindex          # recompõe vetores sem reprocessar PDF
 ```
 
-## Uso — MCP
+## Uso — MCP (o sistema de retrieval)
 
 ```bash
 claude mcp add knowledge-base -- E:/Rag-Project/.venv/Scripts/python.exe E:/Rag-Project/mcp_server.py
 ```
 
-Onze tools, agrupadas por intenção:
-
 | Grupo | Tools |
 |---|---|
 | Busca e leitura | `search` · `fetch` · `get_outline` |
 | Descoberta | `list_collections` · `list_documents` |
-| Auto-gerenciamento | `ingest` · `job_status` · `manage_collection` · `status` |
-| Enriquecimento | `get_pending_enrichment` · `submit_enrichment` |
+| Auto-gerenciamento | `ingest` · `job_status` · `manage_collection` · `delete_document` · `reindex` · `status` |
 
-O agente se vira sozinho: descobre o que existe, dispara ingestão a partir de um
-caminho que o usuário mencionou na conversa, acompanha o progresso e inspeciona
-a saúde da base — tudo sem sair do chat.
+As tools de auto-gerenciamento existem para o agente não precisar ler o
+repositório nem montar linhas de comando — economizam contexto e tornam o
+comportamento previsível.
 
 ### Collections
 
 Recortes independentes de conhecimento. Um documento pode estar em várias sem
 duplicar armazenamento. `search` sem escopo busca em tudo; com
 `collections=["fisica-3"]` isola a prateleira.
-
-### Enriquecimento delegado
-
-Resumos são escritos pelo **agente**, não por um LLM local: `get_pending_enrichment`
-devolve o material, `submit_enrichment` grava o resultado, e o estado fica no
-SQLite — o laço pode parar e retomar. A navegação (`get_outline`) não depende
-disso: sai dos títulos que o Docling extraiu do layout, de graça.
 
 ## Configuração
 
@@ -128,20 +142,27 @@ Tudo em `kb/config.py`, sobrescrevível por variável de ambiente:
 |---|---|---|
 | `KB_INGEST_ROOTS` | `E:\Estudo`, raiz do projeto | Pastas de onde a ingestão pode ler |
 | `KB_EMBED_MODEL` | `BAAI/bge-m3` | Trocar exige `reindex --reset` |
+| `KB_LLM_MODEL` | `qwen3:8b` | LLM do Pass 3 |
+| `KB_LLM` | `1` | `0` desliga o Pass 3 |
+| `KB_ENRICH_SECTIONS` | `0` | `1` também resume seções (custa centenas de chamadas) |
 | `KB_RERANK` | `1` | `0` desliga o rerank |
 | `KB_CHUNK_MAX_TOKENS` | `512` | Teto do chunk |
-| `KB_MODEL_IDLE_TIMEOUT` | `600` | Segundos até descarregar da VRAM |
 | `KB_DEVICE` | `cuda` | `cpu` para rodar sem GPU |
 
-`KB_INGEST_ROOTS` é uma guarda de segurança: a ingestão é disparada por um
+`KB_INGEST_ROOTS` é uma guarda de segurança: a ingestão pode ser disparada por um
 agente, que pode ser induzido pelo conteúdo de um documento a indexar arquivos
 arbitrários do disco. Caminhos fora das raízes são recusados.
 
-## Segurança e limites conhecidos
+## Limites conhecidos
 
-- O filtro por `doc_id` no Chroma usa `$in`; uma collection com milhares de
-  documentos degrada a consulta. É o gatilho para migrar o índice para LanceDB —
-  a interface `VectorIndex` em `kb/vectors.py` já isola essa troca.
-- `status` reporta divergência entre SQLite e índice vetorial. É a falha
-  silenciosa típica: a busca continua respondendo e o que falta simplesmente
-  nunca aparece.
+- **PDF escaneado degrada os títulos.** O OCR produz headings colados
+  (`Potencialdeduplacamada`), o que afeta `heading_path` e `get_outline`.
+- **Import lento nesta máquina.** `import torch` + `sentence_transformers` levam
+  ~150 s por processo, o que domina o custo de subir qualquer coisa. O servidor
+  MCP contorna carregando no startup; a ingestão paga uma vez por job. Vale
+  investigar exclusão do antivírus para o `.venv`.
+- **O filtro por `doc_id` no Chroma usa `$in`**; uma collection com milhares de
+  documentos degrada a consulta. É o gatilho para migrar para LanceDB — a
+  interface `VectorIndex` em `kb/vectors.py` já isola essa troca.
+- **`status` reporta divergência** entre SQLite e índice vetorial. É a falha
+  silenciosa típica: a busca continua respondendo e o que falta nunca aparece.

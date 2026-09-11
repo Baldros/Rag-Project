@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from mcp.server import MCPServer
@@ -28,18 +30,66 @@ from kb.db import init_db
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("kb.mcp")
 
+
+def _warm_models() -> None:
+    """Sobe os modelos de recuperação fora da thread do protocolo."""
+    try:
+        from kb.models import preload
+
+        preload()
+    except Exception:
+        # Falhar aqui não pode derrubar o servidor: as tools que não dependem de
+        # modelo (listagens, outline, fetch, status) continuam servindo, e a
+        # busca tenta carregar sob demanda.
+        logger.exception("Pré-carregamento dos modelos falhou")
+
+
+@asynccontextmanager
+async def lifespan(_server: MCPServer):
+    """
+    O ciclo de vida dos modelos é o do servidor.
+
+    Sobe: dispara o carregamento em background, para o handshake responder na
+    hora enquanto os ~150s de import e carga correm em paralelo com a
+    inicialização do cliente. Uma busca que chegue antes do fim simplesmente
+    espera no mesmo lock, em vez de disparar uma segunda carga.
+
+    Cai: devolve a VRAM explicitamente, sem depender do fim do processo.
+    """
+    init_db()
+
+    warmer = threading.Thread(target=_warm_models, name="kb-warmup", daemon=True)
+    warmer.start()
+    logger.info("knowledge-base MCP pronto (stdio); modelos carregando em background")
+
+    try:
+        yield {}
+    finally:
+        from kb.models import unload_all
+
+        released = unload_all()
+        logger.info("Servidor encerrado; VRAM liberada: %s", released or "nada carregado")
+
+
 server = MCPServer(
+    lifespan=lifespan,
     name="knowledge-base",
     instructions=(
         "Base de conhecimento sobre documentos PDF indexados, organizada em "
         "collections (recortes temáticos independentes).\n\n"
-        "Fluxo usual: `list_collections` para ver o que existe, `search` para "
-        "encontrar passagens (devolve a seção inteira, com arquivo e páginas "
-        "para citar), `fetch` para ler adiante e `get_outline` para navegar a "
-        "estrutura de um documento.\n\n"
-        "Para adicionar material use `ingest` com o caminho do arquivo ou pasta: "
-        "ela retorna um job_id na hora e o processamento segue em background — "
-        "acompanhe com `job_status`.\n\n"
+        "Seu papel aqui é **consumir** conhecimento já processado. Fluxo usual: "
+        "`list_collections` para ver o que existe, `search` para encontrar "
+        "passagens (devolve a seção inteira, com arquivo e páginas para citar), "
+        "`fetch` para ler adiante e `get_outline` para navegar a estrutura de um "
+        "documento.\n\n"
+        "A ingestão é um sistema à parte, que roda sozinho e não depende de você: "
+        "converte o PDF, indexa e resume com um modelo local. A tool `ingest` é "
+        "só um atalho para dispará-lo sem você precisar montar a linha de "
+        "comando. Ela devolve um job_id na hora e o processamento segue em "
+        "background — acompanhe com `job_status`. Não escreva resumos nem "
+        "conteúdo para a base; isso é trabalho da ingestão.\n\n"
+        "Se uma busca voltar com `incomplete: true`, há ingestão em andamento "
+        "naquele escopo e os resultados cobrem só o que já foi indexado.\n\n"
         "Toda citação devolvida por `search` traz nome do arquivo e intervalo de "
         "páginas reais. Use-os; não invente referência."
     ),
@@ -81,6 +131,7 @@ def search(
         Passagens com texto, arquivo de origem, intervalo de páginas e o caminho
         de títulos até a seção.
     """
+    from kb.jobs import active_jobs
     from kb.retrieval import search as run_search
 
     results = run_search(
@@ -92,13 +143,34 @@ def search(
         use_rerank=rerank,
     )
 
-    return {
+    payload: dict[str, Any] = {
         "query": query,
         "scope": collections or doc_ids or "toda a base",
         "n_results": len(results),
         "results": results,
-        "note": None if results else "Nenhuma passagem encontrada. Verifique o escopo com list_collections.",
     }
+
+    # Buscar numa collection que está sendo ingerida devolve só o que já foi
+    # embedado. Sem este aviso a resposta parece completa e não é.
+    running = active_jobs(collections)
+    if running:
+        payload["incomplete"] = True
+        payload["warning"] = (
+            f"{len(running)} ingestão(ões) em andamento neste escopo — estes "
+            "resultados cobrem apenas o que já foi indexado. Acompanhe com "
+            "job_status e repita a busca ao final se a resposta parecer incompleta."
+        )
+        payload["jobs_running"] = [
+            {"job_id": job["job_id"], "progress": f"{job['progress']}/{job['total']}"}
+            for job in running
+        ]
+
+    if not results:
+        payload["note"] = (
+            "Nenhuma passagem encontrada. Verifique o escopo com list_collections."
+        )
+
+    return payload
 
 
 @server.tool()
@@ -213,6 +285,7 @@ def ingest(
     collection: str | None = None,
     collection_name: str | None = None,
     force: bool = False,
+    enrich: bool = True,
 ) -> dict[str, Any]:
     """Indexa PDFs a partir de um caminho de arquivo ou pasta.
 
@@ -230,6 +303,8 @@ def ingest(
         collection: Slug da collection de destino. Criada se não existir.
         collection_name: Nome legível, usado apenas na criação.
         force: Reprocessa mesmo o que já está indexado.
+        enrich: Gera resumos com o LLM local ao final. Desligue para uma
+            ingestão mais rápida; os resumos podem ser feitos depois.
     """
     from kb import collection as collections_api
     from kb.jobs import PathNotAllowed, spawn_ingest
@@ -241,7 +316,7 @@ def ingest(
                 collection_id=collection,
             )
 
-        return spawn_ingest(paths, collection, force=force)
+        return spawn_ingest(paths, collection, force=force, enrich=enrich)
 
     except PathNotAllowed as exc:
         return {"error": "caminho não autorizado", "detail": str(exc)}
@@ -333,65 +408,60 @@ def status(collection: str | None = None) -> dict[str, Any]:
 
 
 @server.tool()
-def get_pending_enrichment(
-    kind: Literal["document", "section"] = "document",
-    limit: int = 1,
-    collection: str | None = None,
-) -> dict[str, Any]:
-    """Pega o próximo item que precisa de resumo, com o material para resumir.
+def delete_document(doc_id: str, purge_artifacts: bool = False) -> dict[str, Any]:
+    """Remove um documento da base inteira.
 
-    O servidor não roda nenhum LLM: quem escreve os resumos é você. Leia o que
-    vem aqui, produza o resumo e devolva com `submit_enrichment`. Repita até a
-    fila esvaziar.
-
-    Comece por `kind="document"` — são poucos itens e alimentam o catálogo que
-    aparece em `list_documents`. Resumo de seção é opcional e só vale a pena
-    para seções longas.
+    Diferente de `manage_collection` com `remove_docs`, que apenas tira o
+    documento de uma collection e o deixa na base — ainda aparecendo em buscas
+    sem escopo. Aqui somem o texto, a estrutura e os vetores.
 
     Args:
-        kind: "document" (resumo geral da obra) ou "section" (trecho).
-        limit: Quantos itens trazer de uma vez.
-        collection: Restringe a fila a uma collection.
+        doc_id: Id do documento (veja `list_documents`).
+        purge_artifacts: Também apaga o resultado do parse guardado em disco.
+            Por padrão ele é preservado, porque é a parte cara de reconstruir e
+            torna uma reingestão futura quase instantânea.
     """
-    from kb.enrich import get_pending, pending_counts
+    from kb.collection import delete_document as run_delete
 
-    items = get_pending(kind, limit, collection)
-
-    return {
-        "kind": kind,
-        "items": items,
-        "remaining": pending_counts(),
-        "note": None if items else "Fila vazia para este tipo.",
-    }
+    return run_delete(doc_id, purge_artifacts=purge_artifacts)
 
 
 @server.tool()
-def submit_enrichment(
-    kind: Literal["document", "section"],
-    target_id: str,
-    summary: str,
-    key_topics: list[str] | None = None,
-) -> dict[str, Any]:
-    """Grava um resumo que você produziu para um documento ou seção.
+def reindex(collection: str | None = None, reset: bool = False) -> dict[str, Any]:
+    """Recompõe o índice vetorial a partir do banco estrutural.
 
-    Baseie-se apenas no material recebido em `get_pending_enrichment`. O resumo
-    fica gravado permanentemente e passa a aparecer em `list_documents` e
-    `get_outline`.
+    Use quando `status` apontar divergência entre o banco e o índice. Não relê
+    nenhum PDF: o texto já está guardado, só os vetores são recalculados.
 
     Args:
-        kind: "document" ou "section".
-        target_id: O `target_id` que veio em `get_pending_enrichment`.
-        summary: O resumo.
-        key_topics: Tópicos-chave (só para documentos).
+        collection: Limita a uma collection. Omita para a base toda.
+        reset: Invalida todos os vetores antes de recomeçar. Necessário ao
+            trocar de modelo de embedding; desnecessário para apenas preencher
+            o que falta.
     """
-    from kb.enrich import submit
+    from kb.collection import resolve_scope
+    from kb.ingest.embed import embed_pending, reset_embeddings
 
-    return submit(kind, target_id, summary, key_topics)
+    doc_ids = resolve_scope([collection] if collection else None)
+
+    if doc_ids is not None and not doc_ids:
+        return {"error": f"collection sem documentos: {collection}"}
+
+    invalidated = reset_embeddings(doc_ids) if reset else 0
+    embedded = embed_pending(doc_ids=doc_ids)
+
+    from kb.health import consistency
+
+    return {
+        "scope": collection or "toda a base",
+        "invalidated": invalidated,
+        "embedded": embedded,
+        "consistency": consistency(),
+    }
 
 
 def main() -> None:
-    init_db()
-    logger.info("knowledge-base MCP pronto (stdio)")
+    # init_db, carga e descarga dos modelos ficam no `lifespan`.
     server.run(transport="stdio")
 
 
