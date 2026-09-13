@@ -60,3 +60,5 @@ Model/
 .env
 .env.*
 !.env.example
+.*
+!.gitignore
