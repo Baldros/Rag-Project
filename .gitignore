@@ -1,8 +1,64 @@
-# Pastas
-.venv*/
-chroma_db/
-out/
-__pycache__/
+# Este repositório versiona SOMENTE código-fonte.
+#
+# A base de dados nunca entra. Dois motivos:
+#   1. O repositório é público, e o conteúdo indexado tem direitos autorais.
+#   2. Tudo em store/ é reconstruível — os artefatos vêm dos PDFs e o índice
+#      vetorial vem do SQLite. Versionar seria carregar peso sem ganho.
+#
+# As regras abaixo são em duas camadas: por caminho conhecido e por extensão.
+# A segunda existe porque KB_STORE_DIR pode apontar para outro lugar, e porque
+# um PDF solto na raiz não deve escapar por não estar num diretório previsto.
 
-# variáveis de ambiente
+# ---------- Ambiente ----------
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# ---------- Base de dados (por caminho) ----------
+store/
+store*/
+artifacts/
+chroma_db/
+chroma*/
+out/
+Model/
+.testdata/
+
+# ---------- Base de dados (por extensão, rede de segurança) ----------
+# Documentos-fonte
+*.pdf
+*.epub
+*.docx
+*.pptx
+
+# Bancos
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Índices e dumps vetoriais
+*.parquet
+*.lance
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Pesos de modelo (baixam sozinhos para ~/.cache/huggingface)
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# ---------- Segredos ----------
 .env
+.env.*
+!.env.example
+.*
+!.gitignore
