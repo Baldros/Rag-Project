@@ -65,12 +65,12 @@ def get(
     return dict(row) if row else None
 
 
-def list_all(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+def list_all(conn: sqlite3.Connection | None = None, limit: int | None = None,
+             offset: int = 0) -> list[dict[str, Any]]:
     """Collections com contagens, para o agente saber o que existe."""
     conn = conn or get_conn()
 
-    rows = conn.execute(
-        """
+    query = """
         SELECT c.collection_id,
                c.name,
                c.description,
@@ -82,9 +82,13 @@ def list_all(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
         LEFT JOIN document_collections dc ON dc.collection_id = c.collection_id
         LEFT JOIN documents d             ON d.doc_id = dc.doc_id
         GROUP BY c.collection_id
-        ORDER BY c.name
+        ORDER BY c.name, c.collection_id
         """
-    ).fetchall()
+    if limit is not None or offset:
+        query += " LIMIT ? OFFSET ?"
+        rows = conn.execute(query, (limit if limit is not None else -1, offset)).fetchall()
+    else:
+        rows = conn.execute(query).fetchall()
 
     return [dict(row) for row in rows]
 
@@ -305,22 +309,28 @@ def delete_document(
 def documents_in(
     collection_id: str | None = None,
     conn: sqlite3.Connection | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Catálogo de documentos, opcionalmente filtrado por collection."""
     conn = conn or get_conn()
 
     if collection_id:
-        rows = conn.execute(
-            """
+        query = """
             SELECT d.*
             FROM documents d
             JOIN document_collections dc ON dc.doc_id = d.doc_id
             WHERE dc.collection_id = ?
-            ORDER BY d.filename
-            """,
-            (collection_id,),
-        ).fetchall()
+            ORDER BY d.filename, d.doc_id
+            """
+        params: list[Any] = [collection_id]
     else:
-        rows = conn.execute("SELECT * FROM documents ORDER BY filename").fetchall()
+        query = "SELECT * FROM documents ORDER BY filename, doc_id"
+        params = []
+
+    if limit is not None or offset:
+        query += " LIMIT ? OFFSET ?"
+        params.extend((limit if limit is not None else -1, offset))
+    rows = conn.execute(query, params).fetchall()
 
     return [dict(row) for row in rows]

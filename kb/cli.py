@@ -21,6 +21,26 @@ def _missing(kind: str, identifier: str):
     raise SessionError("NOT_FOUND", f"{kind} não encontrado: {identifier}")
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Informe um inteiro maior que zero") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("Informe um inteiro maior que zero")
+    return value
+
+
+def _nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Informe um inteiro não negativo") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("Informe um inteiro não negativo")
+    return value
+
+
 def _wait_job(job_id: str) -> dict[str, Any]:
     from kb.jobs import get_job
 
@@ -47,9 +67,12 @@ def _run(args: argparse.Namespace) -> Any:
     if cmd == "on":
         return session.start(args.mode)
     if cmd == "off":
-        return session.stop(cancel=args.cancel, interactive=not args.wait)
+        return session.stop(cancel=args.cancel, interactive=not (args.wait or args.no_wait),
+                            fail_if_busy=args.no_wait)
     if cmd == "switch":
-        return session.switch(args.mode, cancel=args.cancel, interactive=not args.wait)
+        return session.switch(args.mode, cancel=args.cancel,
+                              interactive=not (args.wait or args.no_wait),
+                              fail_if_busy=args.no_wait)
     if cmd == "session":
         return session.status()
     if cmd == "search":
@@ -75,15 +98,20 @@ def _run(args: argparse.Namespace) -> Any:
             return fetch_section(args.section_id) or _missing("seção", args.section_id)
         if not args.doc_id or args.page_start is None:
             raise SessionError("USAGE_ERROR", "Informe --section-id ou --doc-id e --page-start")
-        return fetch_pages(args.doc_id, args.page_start, args.page_end)
+        result = fetch_pages(args.doc_id, args.page_start, args.page_end)
+        return result if result["filename"] is not None else _missing("documento", args.doc_id)
     if cmd == "outline":
         from kb.retrieval import get_outline
 
-        return get_outline(args.doc_id, max_depth=args.max_depth)
+        result = get_outline(args.doc_id, max_depth=args.max_depth)
+        return result if "error" not in result else _missing("documento", args.doc_id)
     if cmd == "status":
         from kb.health import status
 
-        return status(args.collection)
+        result = status(args.collection)
+        if args.collection and "error" in result.get("collection", {}):
+            return _missing("collection", args.collection)
+        return result
     if cmd == "doctor":
         from kb.health import consistency, orphan_artifacts
 
@@ -104,7 +132,7 @@ def _run(args: argparse.Namespace) -> Any:
 
         action = args.action
         if action == "list":
-            return api.list_all()
+            return api.list_all(limit=args.limit, offset=args.offset)
         if action == "show":
             return api.get(args.collection) or _missing("collection", args.collection)
         if action == "create":
@@ -114,6 +142,8 @@ def _run(args: argparse.Namespace) -> Any:
             return api.update(args.collection, args.name, args.description) or _missing(
                 "collection", args.collection)
         if action == "delete":
+            if not api.get(args.collection):
+                return _missing("collection", args.collection)
             return api.delete(args.collection, delete_documents=args.delete_documents)
         if action == "add-docs":
             return {"added": api.add_documents(args.collection, args.doc_ids)}
@@ -123,7 +153,7 @@ def _run(args: argparse.Namespace) -> Any:
         from kb import collection as api
 
         if args.action == "list":
-            return api.documents_in(args.collection)
+            return api.documents_in(args.collection, limit=args.limit, offset=args.offset)
         if args.action == "show":
             from kb.db import get_conn
 
@@ -131,12 +161,13 @@ def _run(args: argparse.Namespace) -> Any:
                                      (args.doc_id,)).fetchone()
             return dict(row) if row else _missing("documento", args.doc_id)
         if args.action == "delete":
-            return api.delete_document(args.doc_id, purge_artifacts=args.purge_artifacts)
+            result = api.delete_document(args.doc_id, purge_artifacts=args.purge_artifacts)
+            return result if result["ok"] else _missing("documento", args.doc_id)
     if cmd == "jobs":
         from kb.jobs import get_job, list_jobs
 
         if args.action == "list":
-            return list_jobs(args.limit)
+            return list_jobs(args.limit, offset=args.offset)
         if args.action == "show":
             return get_job(args.job_id) or _missing("job", args.job_id)
         if args.action == "cancel":
@@ -154,11 +185,15 @@ def build_parser() -> JsonParser:
     p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
     p = sub.add_parser("off", help="desliga sessão e libera recursos")
     p.add_argument("--cancel", action="store_true")
-    p.add_argument("--wait", action="store_true")
+    waiting = p.add_mutually_exclusive_group()
+    waiting.add_argument("--wait", action="store_true")
+    waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     p = sub.add_parser("switch", help="troca explicitamente de modo")
     p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
     p.add_argument("--cancel", action="store_true")
-    p.add_argument("--wait", action="store_true")
+    waiting = p.add_mutually_exclusive_group()
+    waiting.add_argument("--wait", action="store_true")
+    waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     sub.add_parser("session", help="estado da sessão sem carregar modelos")
     p = sub.add_parser("search", help="busca híbrida em modo interaction")
     p.add_argument("query")
@@ -192,7 +227,9 @@ def build_parser() -> JsonParser:
     sub.add_parser("models", help="modelos e provedores configurados")
     p = sub.add_parser("collections", help="gerencia collections")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("list")
+    item = actions.add_parser("list")
+    item.add_argument("--limit", type=_positive_int)
+    item.add_argument("--offset", type=_nonnegative_int, default=0)
     for action in ("show", "create", "update", "delete", "add-docs", "remove-docs"):
         item = actions.add_parser(action)
         item.add_argument("collection")
@@ -205,7 +242,10 @@ def build_parser() -> JsonParser:
             item.add_argument("doc_ids", nargs="+")
     p = sub.add_parser("documents", help="lista e gerencia documentos")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("list").add_argument("--collection")
+    item = actions.add_parser("list")
+    item.add_argument("--collection")
+    item.add_argument("--limit", type=_positive_int)
+    item.add_argument("--offset", type=_nonnegative_int, default=0)
     actions.add_parser("show").add_argument("doc_id")
     item = actions.add_parser("delete")
     item.add_argument("doc_id")
@@ -214,7 +254,9 @@ def build_parser() -> JsonParser:
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
     actions.add_parser("show").add_argument("job_id")
     actions.add_parser("cancel").add_argument("job_id")
-    actions.add_parser("list").add_argument("--limit", type=int, default=10)
+    item = actions.add_parser("list")
+    item.add_argument("--limit", type=_positive_int, default=10)
+    item.add_argument("--offset", type=_nonnegative_int, default=0)
     return parser
 
 

@@ -288,7 +288,7 @@ def _await_exit(pid: int, handle, timeout: float = 60) -> bool:
     return False
 
 
-def _stop_locked(cancel: bool, interactive: bool) -> dict[str, Any]:
+def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False) -> dict[str, Any]:
     state = _read_state()
     live = _probe(state)
     if not state or not live:
@@ -296,6 +296,9 @@ def _stop_locked(cancel: bool, interactive: bool) -> dict[str, Any]:
         return {"active": False, "already_off": True}
     job_id = live.get("job_id")
     if job_id and not cancel:
+        if fail_if_busy:
+            raise SessionError("BUSY", f"Job {job_id} em andamento",
+                               f"Consulte `kb jobs show {job_id}` ou cancele explicitamente")
         cancel = _decision(state, interactive)
     latest = _probe(state)
     if latest is None:
@@ -343,16 +346,18 @@ def _stop_locked(cancel: bool, interactive: bool) -> dict[str, Any]:
     return result
 
 
-def stop(cancel: bool = False, interactive: bool = False) -> dict[str, Any]:
+def stop(cancel: bool = False, interactive: bool = False,
+         fail_if_busy: bool = False) -> dict[str, Any]:
     with _locked():
-        return _stop_locked(cancel, interactive)
+        return _stop_locked(cancel, interactive, fail_if_busy)
 
 
-def switch(mode: str, cancel: bool = False, interactive: bool = False) -> dict[str, Any]:
+def switch(mode: str, cancel: bool = False, interactive: bool = False,
+           fail_if_busy: bool = False) -> dict[str, Any]:
     with _locked():
         current = _probe(_read_state())
         if current and current["mode"] == mode:
             return current
         if current:
-            _stop_locked(cancel, interactive)
+            _stop_locked(cancel, interactive, fail_if_busy)
         return _start_locked(mode)
