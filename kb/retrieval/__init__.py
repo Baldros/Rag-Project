@@ -1,7 +1,7 @@
 """
 API pública de retrieval.
 
-Um ponto de entrada só, usado tanto pelo CLI quanto pelas tools do MCP.
+Um ponto de entrada para busca e leitura, exposto pela CLI.
 """
 
 from __future__ import annotations

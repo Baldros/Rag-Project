@@ -175,8 +175,7 @@ def ingest_paths(
     Três passes sequenciais, um modelo por vez na GPU — Docling, depois o
     embedder, depois o LLM. Cada um descarrega antes do próximo.
 
-    Não depende de agente nem do servidor MCP: esta função é o sistema de
-    ingestão, e o CLI e a tool `ingest` são apenas duas formas de chamá-la.
+    O processo de sessão de ingestão chama esta função após ativação manual.
     """
     conn = conn or get_conn()
     files = expand_paths(paths)
@@ -269,6 +268,8 @@ def ingest_paths(
     if touched and enrich:
         from kb.enrich import run_pass
 
+        if on_progress:
+            on_progress("enrich", 0, 1, "iniciando resumos")
         result["enrichment"] = run_pass(
             doc_ids=touched,
             on_progress=lambda done, total, msg: (

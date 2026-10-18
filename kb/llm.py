@@ -1,17 +1,12 @@
-"""
-Cliente do LLM local — Ollama.
+"""Geração de resumos por adapter configurável.
 
 Usado apenas pelo Pass 3 da ingestão, para processamento de texto: resumir um
 documento ou uma seção. Não precisa de tool calling, nem de contexto longo, nem
 de raciocínio elaborado. É o membro mais pesado do sistema e por isso o que mais
 se beneficia da descarga explícita.
 
-O Ollama é um serviço externo, não um pacote Python. A conversa é HTTP sobre
-`httpx`, que já vem instalado como dependência do `mcp` — nenhuma dependência
-nova entra por causa disto.
-
-O LLM nunca aparece no caminho de busca. Lá quem raciocina é o agente que
-consome o MCP.
+O Ollama é o adapter inicial; outros provedores implementam o mesmo contrato.
+O gerador só é usado no passo de enriquecimento da ingestão.
 """
 
 from __future__ import annotations
@@ -35,10 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 class LLMUnavailable(RuntimeError):
-    """Ollama fora do ar ou modelo ausente."""
+    """O provedor de geração não está pronto."""
 
 
-def is_available() -> bool:
+def _ollama_available() -> bool:
     """Checagem barata, para decidir se vale rodar o Pass 3."""
     if not LLM_ENABLED:
         return False
@@ -67,7 +62,7 @@ def is_available() -> bool:
     return False
 
 
-def generate(
+def _ollama_generate(
     prompt: str,
     system: str | None = None,
     max_tokens: int = 700,
@@ -117,7 +112,7 @@ def strip_reasoning(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
 
 
-def unload() -> bool:
+def _ollama_unload() -> bool:
     """
     Tira o modelo da VRAM imediatamente.
 
@@ -126,13 +121,52 @@ def unload() -> bool:
     fim da ingestão.
     """
     try:
-        httpx.post(
+        response = httpx.post(
             f"{OLLAMA_URL}/api/generate",
             json={"model": LLM_MODEL, "keep_alive": 0},
             timeout=30.0,
         )
+        response.raise_for_status()
         logger.info("LLM %s descarregado da VRAM", LLM_MODEL)
         return True
     except Exception as exc:
         logger.warning("Não consegui descarregar %s: %s", LLM_MODEL, exc)
         return False
+
+
+class OllamaAdapter:
+    def is_available(self) -> bool:
+        return _ollama_available()
+
+    def generate(self, prompt: str, system: str | None, max_tokens: int) -> str:
+        return _ollama_generate(prompt, system, max_tokens)
+
+    def unload(self) -> bool:
+        return _ollama_unload()
+
+
+_adapter = None
+
+
+def _provider():
+    global _adapter
+    if _adapter is None:
+        from kb.providers import generation_adapter
+
+        _adapter = generation_adapter()
+    return _adapter
+
+
+def is_available() -> bool:
+    return _provider().is_available()
+
+
+def generate(prompt: str, system: str | None = None, max_tokens: int = 700) -> str:
+    return _provider().generate(prompt, system, max_tokens)
+
+
+def unload(force: bool = False) -> bool:
+    """Unload a model used by this process, or by a cancelled runtime."""
+    if _adapter is None and not force:
+        return False
+    return _provider().unload()

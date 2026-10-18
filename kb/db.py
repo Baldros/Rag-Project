@@ -144,7 +144,7 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     """
     Abre conexão configurada para uso concorrente.
 
-    O worker de ingestão escreve enquanto o servidor MCP lê, então WAL e
+    O job de ingestão escreve enquanto consultas podem ler, então WAL e
     busy_timeout não são opcionais: sem eles a leitura falha com "database is
     locked" no meio de uma ingestão.
     """
@@ -180,8 +180,8 @@ def get_conn() -> sqlite3.Connection:
     """
     Conexao por thread.
 
-    Conexoes do sqlite3 nao sao seguras entre threads, e o servidor MCP atende
-    chamadas concorrentes: cada thread precisa da sua.
+    Conexoes do sqlite3 nao sao seguras entre threads: o job de ingestão e o
+    processo de sessão precisam de conexões próprias.
     """
     conn = getattr(_local, "conn", None)
 

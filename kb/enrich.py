@@ -1,14 +1,10 @@
 """
 Pass 3 — enriquecimento com LLM local.
 
-Resumo é processamento de texto e pertence ao **sistema de ingestão**. Uma
-versão anterior deste módulo delegava isso ao agente que consome o MCP, via fila
-pull; estava errado, porque fazia a ingestão depender da camada de consumo — uma
-ingestão rodada por CLI, sem nenhum agente conectado, sairia sem resumo nenhum.
+Resumo é processamento de texto e pertence ao **sistema de ingestão**.
 
-Aqui o LLM roda local, sozinho na GPU, depois que o Docling e o embedder já
-saíram. É o pass mais pesado e o mais dispensável: se o Ollama estiver fora do
-ar, os Passes 1 e 2 continuam valendo e o enriquecimento fica pendente.
+O gerador roda depois que o Docling e o embedder saíram. Se o provider estiver
+indisponível, os Passes 1 e 2 continuam valendo e o enriquecimento fica pendente.
 
 Escopo por padrão: **documento sim, seção não**. O resumo de documento custa
 dezenas de chamadas e alimenta o catálogo; o de seção custa centenas e a
@@ -235,7 +231,7 @@ def run_pass(
     """
     Pass 3 completo: documentos e, opcionalmente, seções.
 
-    Nunca levanta por causa do LLM. Se o Ollama estiver fora, devolve o que
+    Nunca levanta por causa do LLM. Se o provider estiver fora, devolve o que
     conseguiu e reporta `skipped`, deixando o enriquecimento pendente para uma
     próxima rodada — uma ingestão não deve falhar por causa de um resumo.
     """

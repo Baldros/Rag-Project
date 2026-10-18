@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol, Sequence
 
-from kb.config import CHROMA_COLLECTION, CHROMA_DIR, EMBED_MODEL
+from kb.config import CHROMA_COLLECTION, CHROMA_DIR, EMBED_ID
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,8 @@ class VectorIndex(Protocol):
 
     def reset(self) -> None: ...
 
+    def embedding_identity(self) -> str | None: ...
+
 
 class ChromaIndex:
     """Implementação sobre ChromaDB persistente."""
@@ -59,10 +61,13 @@ class ChromaIndex:
         self._collection = self._client.get_or_create_collection(
             name=self._name,
             metadata={
-                "embedding_model": EMBED_MODEL,
+                "embedding_model": EMBED_ID,
                 "hnsw:space": "cosine",
             },
         )
+
+    def embedding_identity(self) -> str | None:
+        return (self._collection.metadata or {}).get("embedding_model")
 
     def upsert(
         self,
@@ -119,18 +124,25 @@ class ChromaIndex:
         self._client.delete_collection(self._name)
         self._collection = self._client.get_or_create_collection(
             name=self._name,
-            metadata={"embedding_model": EMBED_MODEL, "hnsw:space": "cosine"},
+            metadata={"embedding_model": EMBED_ID, "hnsw:space": "cosine"},
         )
 
 
 _index: ChromaIndex | None = None
 
 
-def get_index() -> ChromaIndex:
+def get_index(allow_mismatch: bool = False) -> ChromaIndex:
     """Singleton preguiçoso — abrir o Chroma custa I/O."""
     global _index
 
     if _index is None:
         _index = ChromaIndex()
+
+    actual = _index.embedding_identity()
+    if not allow_mismatch and actual != EMBED_ID:
+        raise RuntimeError(
+            f"Índice criado com embedding {actual!r}, configuração atual {EMBED_ID!r}. "
+            "Execute `kb reindex --reset` no modo ingestion antes de buscar."
+        )
 
     return _index

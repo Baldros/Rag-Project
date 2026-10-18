@@ -35,9 +35,8 @@ def _parse_roots(raw: str | None) -> tuple[Path, ...]:
     )
 
 
-# Diretórios de onde a ingestão pode ler. A tool `ingest` recusa qualquer caminho
-# fora daqui: sem essa guarda, um agente induzido pelo conteúdo de um documento
-# poderia indexar arquivos arbitrários do disco.
+# Diretórios de onde a ingestão pode ler. O comando `ingest` recusa caminhos
+# fora daqui, inclusive quando chamado por outro programa.
 ALLOWED_INGEST_ROOTS: tuple[Path, ...] = _parse_roots(
     os.getenv("KB_INGEST_ROOTS")
 ) or (
@@ -50,12 +49,20 @@ ALLOWED_INGEST_ROOTS: tuple[Path, ...] = _parse_roots(
 # Modelos
 # =========================
 
-# Ambos rodam via sentence-transformers/torch. Runtime único dá controle
-# explícito de carga e descarga da VRAM, que é o requisito central deste projeto.
+# Cada papel escolhe um adapter e um modelo separadamente. Trocar o embedding
+# exige reconstruir o índice vetorial; trocar reranker/gerador não exige.
+EMBED_PROVIDER = os.getenv("KB_EMBED_PROVIDER", "sentence_transformers")
 EMBED_MODEL = os.getenv("KB_EMBED_MODEL", "BAAI/bge-m3")
+# Preserve the existing store's identity for its default adapter. A different
+# provider must use a distinct vector identity even with the same model label.
+EMBED_ID = (
+    EMBED_MODEL if EMBED_PROVIDER == "sentence_transformers"
+    else f"{EMBED_PROVIDER}:{EMBED_MODEL}"
+)
 EMBED_DIM = 1024
 EMBED_MAX_TOKENS = 8192
 
+RERANK_PROVIDER = os.getenv("KB_RERANK_PROVIDER", "sentence_transformers")
 RERANK_MODEL = os.getenv("KB_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_ENABLED = os.getenv("KB_RERANK", "1") != "0"
 RERANK_MAX_LENGTH = 1024
@@ -63,12 +70,8 @@ RERANK_MAX_LENGTH = 1024
 DEVICE = os.getenv("KB_DEVICE", "cuda")
 TORCH_DTYPE = os.getenv("KB_DTYPE", "float16")
 
-# O ciclo de vida dos modelos é o do servidor: sobem no startup e caem no
-# shutdown. Descarregar por ociosidade sairia caro — nesta máquina o custo de
-# subir de novo é dominado pelos ~150s de `import torch` + `sentence_transformers`,
-# não pela leitura dos pesos — e não compraria nada: a pilha de retrieval ocupa
-# 2,2 GB e não disputa VRAM com mais nada. 0 desliga.
-MODEL_IDLE_TIMEOUT = int(os.getenv("KB_MODEL_IDLE_TIMEOUT", "0"))
+# Modelos residentes só existem em sessões iniciadas explicitamente pela CLI.
+# Não há carga automática nem descarga por ociosidade.
 
 
 # =========================
@@ -82,6 +85,7 @@ MODEL_IDLE_TIMEOUT = int(os.getenv("KB_MODEL_IDLE_TIMEOUT", "0"))
 # O modelo em si ainda nao foi escolhido a serio — merece uma sessao de teste
 # comparativa. qwen3:8b e o ponto de partida; trocar e uma linha.
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+LLM_PROVIDER = os.getenv("KB_LLM_PROVIDER", "ollama")
 LLM_MODEL = os.getenv("KB_LLM_MODEL", "qwen3:8b")
 LLM_ENABLED = os.getenv("KB_LLM", "1") != "0"
 LLM_TEMPERATURE = float(os.getenv("KB_LLM_TEMPERATURE", "0.2"))
@@ -113,6 +117,9 @@ PAGE_BLOCK_SIZE = int(os.getenv("KB_PAGE_BLOCK_SIZE", "15"))
 
 CHUNK_MAX_TOKENS = int(os.getenv("KB_CHUNK_MAX_TOKENS", "512"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("KB_CHUNK_OVERLAP_TOKENS", "64"))
+# Chunking uses its own tokenizer so an embedding provider may change without
+# requiring the parser to understand that provider's model artifact format.
+CHUNK_TOKENIZER_MODEL = os.getenv("KB_CHUNK_TOKENIZER_MODEL", "BAAI/bge-m3")
 
 EMBED_BATCH_SIZE = int(os.getenv("KB_EMBED_BATCH_SIZE", "16"))
 

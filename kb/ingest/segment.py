@@ -24,7 +24,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from kb.config import CHUNK_MAX_TOKENS, EMBED_MODEL
+from kb.config import CHUNK_MAX_TOKENS, CHUNK_TOKENIZER_MODEL
 from kb.ingest.parse import iter_blocks
 from kb.utils import stable_id
 
@@ -39,10 +39,10 @@ _tokenizer: Any = None
 
 def get_chunker():
     """
-    HybridChunker calibrado pelo tokenizer do modelo de embedding.
+    HybridChunker calibrado pelo tokenizer configurado para chunking.
 
-    Usar o tokenizer do bge-m3 (e não uma contagem por caracteres) é o que
-    garante que nenhum chunk estoure a janela do modelo na hora de embedar.
+    Usar contagem por tokens evita chunks grandes demais. Ao trocar de modelo
+    de embedding, configure um tokenizer com limites compatíveis se necessário.
     """
     global _chunker, _tokenizer
 
@@ -53,7 +53,7 @@ def get_chunker():
         )
 
         _tokenizer = HuggingFaceTokenizer.from_pretrained(
-            model_name=EMBED_MODEL,
+            model_name=CHUNK_TOKENIZER_MODEL,
             max_tokens=CHUNK_MAX_TOKENS,
         )
         _chunker = HybridChunker(tokenizer=_tokenizer, merge_peers=True)

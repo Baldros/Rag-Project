@@ -1,4 +1,4 @@
-# Knowledge base — ETL e retrieval para agentes (via MCP)
+# RAG local — ingestão e recuperação via CLI
 #
 # torch é instalado manualmente por causa do CUDA. Nesta máquina:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
@@ -14,13 +14,11 @@ chromadb>=1.5.0          # índice vetorial (camada descartável)
 # Modelos de recuperação (rodam localmente na GPU, via torch)
 sentence-transformers>=6.0.0   # bge-m3 (embedding) e bge-reranker-v2-m3 (rerank)
 
-# Superfície de contato
-mcp>=2.2.0
+# O adapter de geração atual fala com o Ollama por HTTP.
+httpx>=0.27.0
 
-# O LLM do Pass 3 (resumos) fala com o Ollama por HTTP, usando o httpx que já
-# vem com o mcp — nenhum pacote a mais. O Ollama em si é um serviço externo:
+# O Ollama em si é um serviço externo:
 #   ollama pull qwen3:8b
 # Sem ele a ingestão conclui os Passes 1 e 2 e deixa os resumos pendentes.
 #
-# Não há langchain nem llama-index: a geração de resposta é do agente que
-# consome o MCP, e o resumo é do LLM local.
+# Não há langchain nem llama-index; geração de resumos usa um adapter próprio.

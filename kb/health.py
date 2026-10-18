@@ -1,7 +1,7 @@
 """
 Meta-condição da base.
 
-Alimenta a tool `status`, para o agente conseguir se orientar sozinho: o que
+Alimenta o comando `status`: o que
 existe, se está íntegro e se alguma coisa precisa de atenção.
 
 A checagem que mais importa é a de consistência entre o SQLite e o índice
@@ -144,43 +144,27 @@ def status(
 
     from kb.collection import list_all
     from kb.jobs import list_jobs
-    from kb.models import models_info, readiness, vram_info
+    from kb import config, session
 
-    ready = readiness()
+    runtime = session.status()
 
     report: dict[str, Any] = {
-        # Primeiro campo de propósito: é a pergunta que mais importa logo depois
-        # de subir o servidor — "já posso buscar?".
-        "retrieval": {
-            **ready,
-            "hint": (
-                None
-                if ready["ready"]
-                else "modelos ainda carregando; `search` responderá com warming_up até ficarem prontos"
-                if ready["warming_up"]
-                else "modelos não carregados; a primeira busca vai carregá-los sob demanda"
-            ),
-        },
+        "session": runtime,
         "counts": counts(conn),
         "chunks": chunk_stats(conn),
-        # A checagem de consistência importa o chromadb, e durante o aquecimento
-        # esse import fica serializado atrás do `import torch` da thread de
-        # warmup — o lock de import do Python é global. Pular aqui é o que faz
-        # `status` responder na hora justamente quando é mais útil: para saber
-        # se já dá para buscar.
-        "consistency": (
-            {"deferred": "checagem adiada durante o aquecimento dos modelos"}
-            if ready["warming_up"]
-            else consistency(conn)
-        ),
+        "consistency": {"deferred": "execute `kb doctor` para checagem profunda"},
         "models": {
             "embedding": EMBED_MODEL,
             "reranker": RERANK_MODEL if RERANK_ENABLED else None,
             "chunk_max_tokens": CHUNK_MAX_TOKENS,
             "parse_version": parse_version(),
-            "loaded": models_info(),
+            "providers": {
+                "embedding": config.EMBED_PROVIDER,
+                "reranker": config.RERANK_PROVIDER,
+                "generation": config.LLM_PROVIDER,
+            },
         },
-        "gpu": vram_info(),
+        "gpu": _gpu_info(),
         "disk_mb": {
             "total": _dir_size_mb(STORE_DIR),
             "artifacts": _dir_size_mb(ARTIFACTS_DIR),
@@ -204,6 +188,21 @@ def status(
     report["warnings"] = _warnings(report)
 
     return report
+
+
+def _gpu_info() -> dict[str, Any]:
+    """Driver-only probe; status must never import torch or load a model."""
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        used, total = completed.stdout.splitlines()[0].split(",")
+        return {"available": True, "used_mb": int(used), "total_mb": int(total)}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return {"available": False}
 
 
 def _collection_detail(collection_id: str, conn: sqlite3.Connection) -> dict[str, Any]:

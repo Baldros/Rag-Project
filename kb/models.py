@@ -4,10 +4,8 @@ Gerência de modelos e de VRAM.
 Só modelos de **recuperação** vivem aqui — embedding e rerank. O LLM da
 ingestão é outro sistema e mora em `kb/llm.py`.
 
-O ciclo de vida é o do servidor MCP: `preload()` no startup, `unload_all()` no
-shutdown. Descarga por ociosidade existe mas vem desligada
-(`MODEL_IDLE_TIMEOUT=0`), porque nesta máquina recarregar custa os ~150s de
-import do torch e não compraria VRAM que esteja em disputa.
+Só uma sessão iniciada explicitamente carrega modelos. Operações de busca nunca
+os carregam por conta própria: sem sessão pronta, recebem erro claro.
 
 `readiness()` e `ModelSlot.info()` são deliberadamente livres de lock: quem os
 chama está tentando descobrir se a carga terminou, e não pode ficar preso atrás
@@ -23,38 +21,13 @@ import time
 from typing import Any, Callable
 
 from kb.config import (
-    DEVICE,
-    EMBED_MODEL,
-    MODEL_IDLE_TIMEOUT,
     RERANK_ENABLED,
-    RERANK_MAX_LENGTH,
-    RERANK_MODEL,
-    TORCH_DTYPE,
 )
 
 logger = logging.getLogger(__name__)
 
-_REAPER_INTERVAL = 30.0
-
-
-def resolve_device() -> str:
-    """Devolve o device realmente utilizável, caindo para CPU se não houver CUDA."""
-    import torch
-
-    if DEVICE.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA indisponível; usando CPU.")
-        return "cpu"
-
-    return DEVICE
-
-
-def _dtype(device: str):
-    import torch
-
-    if device == "cpu":
-        return torch.float32
-
-    return getattr(torch, TORCH_DTYPE, torch.float16)
+class ModelNotLoaded(RuntimeError):
+    """A sessão necessária ainda não carregou este modelo."""
 
 
 def free_vram() -> None:
@@ -72,7 +45,7 @@ def free_vram() -> None:
 
 
 class ModelSlot:
-    """Um modelo com carga preguiçosa, uso registrado e descarga por ociosidade."""
+    """Um modelo carregado e descarregado explicitamente pela sessão."""
 
     def __init__(self, name: str, loader: Callable[[], Any]) -> None:
         self.name = name
@@ -85,7 +58,7 @@ class ModelSlot:
     def loaded(self) -> bool:
         return self._model is not None
 
-    def get(self) -> Any:
+    def load(self) -> Any:
         with self._lock:
             if self._model is None:
                 started = time.perf_counter()
@@ -96,10 +69,18 @@ class ModelSlot:
                     self.name,
                     time.perf_counter() - started,
                 )
-                _ensure_reaper()
 
             self._last_used = time.monotonic()
             return self._model
+
+    def get(self) -> Any:
+        model = self._model
+        if model is None:
+            raise ModelNotLoaded(
+                f"{self.name} não carregado; execute `kb on --mode interaction`"
+            )
+        self._last_used = time.monotonic()
+        return model
 
     def unload(self) -> bool:
         with self._lock:
@@ -112,15 +93,6 @@ class ModelSlot:
 
         free_vram()
         return True
-
-    def unload_if_idle(self, timeout: float) -> bool:
-        with self._lock:
-            if self._model is None:
-                return False
-            if time.monotonic() - self._last_used < timeout:
-                return False
-
-        return self.unload()
 
     def info(self) -> dict[str, Any]:
         """
@@ -143,26 +115,15 @@ class ModelSlot:
 
 
 def _load_embedder():
-    from sentence_transformers import SentenceTransformer
+    from kb.providers import embedding_adapter
 
-    device = resolve_device()
-    return SentenceTransformer(
-        EMBED_MODEL,
-        device=device,
-        model_kwargs={"torch_dtype": _dtype(device)},
-    )
+    return embedding_adapter()
 
 
 def _load_reranker():
-    from sentence_transformers import CrossEncoder
+    from kb.providers import rerank_adapter
 
-    device = resolve_device()
-    return CrossEncoder(
-        RERANK_MODEL,
-        device=device,
-        max_length=RERANK_MAX_LENGTH,
-        model_kwargs={"torch_dtype": _dtype(device)},
-    )
+    return rerank_adapter()
 
 
 EMBEDDER = ModelSlot("embedder", _load_embedder)
@@ -170,55 +131,13 @@ RERANKER = ModelSlot("reranker", _load_reranker)
 
 _SLOTS = (EMBEDDER, RERANKER)
 
-_reaper: threading.Thread | None = None
-_reaper_lock = threading.Lock()
-
-
-def _reap_loop() -> None:
-    while True:
-        time.sleep(_REAPER_INTERVAL)
-
-        if MODEL_IDLE_TIMEOUT <= 0:
-            continue
-
-        for slot in _SLOTS:
-            try:
-                slot.unload_if_idle(MODEL_IDLE_TIMEOUT)
-            except Exception:  # pragma: no cover
-                logger.exception("Falha ao descarregar %s", slot.name)
-
-
-def _ensure_reaper() -> None:
-    global _reaper
-
-    if MODEL_IDLE_TIMEOUT <= 0:
-        return
-
-    with _reaper_lock:
-        if _reaper is None or not _reaper.is_alive():
-            _reaper = threading.Thread(
-                target=_reap_loop,
-                name="kb-model-reaper",
-                daemon=True,
-            )
-            _reaper.start()
-
-
 def embed_texts(texts: list[str], batch_size: int = 16) -> list[list[float]]:
     """Embeda documentos. Vetores normalizados: similaridade vira produto escalar."""
     if not texts:
         return []
 
     model = EMBEDDER.get()
-    vectors = model.encode(
-        texts,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-
-    return vectors.astype("float32").tolist()
+    return model.embed(texts, batch_size)
 
 
 def embed_query(query: str) -> list[float]:
@@ -237,13 +156,7 @@ def rerank(query: str, documents: list[str]) -> list[float]:
         return []
 
     model = RERANKER.get()
-    scores = model.predict(
-        [(query, doc) for doc in documents],
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-
-    return [float(score) for score in scores]
+    return model.score(query, documents)
 
 
 # Estado do aquecimento, escrito pela thread de warmup e lido pelas tools.
@@ -256,11 +169,7 @@ def preload(rerank: bool = True) -> dict[str, float]:
     """
     Sobe os modelos de recuperação de uma vez.
 
-    Chamado no startup do servidor MCP, em thread de background. Nesta máquina o
-    custo é dominado pelos imports (`import torch` e `sentence_transformers`
-    somam ~150s), não pela leitura dos pesos — e esse custo é por processo, não
-    por modelo. Pagá-lo no startup sobrepõe a espera à inicialização do cliente
-    em vez de despejá-la na primeira busca.
+    Chamado exclusivamente pelo comando manual que inicia a sessão de interação.
     """
     timings: dict[str, float] = {}
 
@@ -270,12 +179,12 @@ def preload(rerank: bool = True) -> dict[str, float]:
 
     try:
         started = time.perf_counter()
-        EMBEDDER.get()
+        EMBEDDER.load()
         timings["embedder"] = round(time.perf_counter() - started, 1)
 
         if rerank:
             started = time.perf_counter()
-            RERANKER.get()
+            RERANKER.load()
             timings["reranker"] = round(time.perf_counter() - started, 1)
     except Exception as exc:
         _warmup["error"] = str(exc)
@@ -291,9 +200,7 @@ def readiness() -> dict[str, Any]:
     """
     Se a busca pode ser atendida agora, sem bloquear para descobrir.
 
-    `warming_up` distingue "ainda carregando" de "nunca começou": no primeiro
-    caso vale esperar e repetir, no segundo a carga sob demanda vai acontecer na
-    própria chamada.
+    `warming_up` distingue "ainda carregando" de "sessão desligada".
     """
     ready = EMBEDDER.loaded and (RERANKER.loaded or not RERANK_ENABLED)
 
@@ -322,7 +229,7 @@ def unload_all() -> list[str]:
     """
     Descarrega tudo e devolve a VRAM.
 
-    Usado no shutdown do servidor e ao fim de um pass de ingestão.
+    Usado ao desligar a sessão e ao fim de um pass de ingestão.
     """
     return [slot.name for slot in _SLOTS if slot.unload()]
 
