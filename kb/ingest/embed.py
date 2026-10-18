@@ -15,9 +15,9 @@ import logging
 import sqlite3
 from typing import Callable
 
-from kb.config import EMBED_BATCH_SIZE, EMBED_MODEL
+from kb.config import EMBED_BATCH_SIZE, EMBED_ID, EMBED_MODEL
 from kb.db import get_conn, transaction
-from kb.models import embed_texts, unload_all
+from kb.models import EMBEDDER, embed_texts, unload_all
 from kb.vectors import get_index
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,7 @@ def embed_pending(
         return 0
 
     logger.info("Embedding de %s chunks com %s", total, EMBED_MODEL)
+    EMBEDDER.load()
 
     done = 0
 
@@ -155,7 +156,7 @@ def _mark_documents_indexed(
                       AND chunks.embedded = 0
                )
             """,
-            [EMBED_MODEL, *params],
+            [EMBED_ID, *params],
         )
 
 
@@ -170,7 +171,10 @@ def reset_embeddings(
     reindexar não relê nenhum PDF.
     """
     conn = conn or get_conn()
-    index = get_index()
+    index = get_index(allow_mismatch=True)
+
+    if doc_ids and index.embedding_identity() != EMBED_ID:
+        raise ValueError("Troca de embedding exige reindexação completa com `reindex --reset`")
 
     if doc_ids:
         placeholders = ",".join("?" * len(doc_ids))
