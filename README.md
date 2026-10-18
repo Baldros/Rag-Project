@@ -50,6 +50,8 @@ job. `ingest` espera o resultado por padrão; `--background` devolve um `job_id`
 `off` e `switch` aguardam o job ativo. Em um terminal interativo, oferecem
 esperar ou cancelar; `--wait` dispensa a pergunta e `--cancel` cancela
 imediatamente. Cancelar encerra a sessão; a ingestão pode ser retomada depois.
+Para chamadas automatizadas, `off --no-wait` e `switch --no-wait` retornam
+`BUSY` se houver job ativo, sem interrompê-lo nem aguardar sua conclusão.
 
 ## CLI
 
@@ -76,11 +78,18 @@ python -m kb.cli jobs show JOB_ID
 python -m kb.cli status
 python -m kb.cli doctor
 python -m kb.cli models
+python -m kb.cli collections list --limit 50 --offset 0
+python -m kb.cli documents list --limit 50 --offset 50
+python -m kb.cli jobs list --limit 10 --offset 0
 ```
 
 `status` consulta o driver da GPU sem carregar modelos. `doctor` faz a checagem
 mais profunda entre SQLite e índice vetorial. A base e os artefatos existentes
 permanecem no mesmo formato.
+As listagens aceitam `--limit` e `--offset` para paginação. Sem essas opções,
+collections e documentos continuam retornando a lista completa; jobs continuam
+limitados aos 10 mais recentes. Itens inexistentes retornam `NOT_FOUND` no
+envelope JSON da CLI.
 
 ## Adapters de modelos
 
