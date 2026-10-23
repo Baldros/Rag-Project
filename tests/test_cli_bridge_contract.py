@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from kb import cli, collection, db, jobs, session
+from kb.retrieval.search import fts_query, lexical_search
 
 
 def invoke(*args: str) -> tuple[int, dict]:
@@ -118,6 +119,57 @@ class BridgeErrorTests(unittest.TestCase):
             "code": "BUSY", "message": "Job running", "hint": "Check job",
         })
         stop.assert_called_once_with(cancel=False, interactive=False, fail_if_busy=True)
+
+
+class LexicalQueryTests(unittest.TestCase):
+    """The BM25 channel exists for the exact technical term the vectors miss."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(db.SCHEMA)
+        self.conn.execute(
+            "INSERT INTO documents(doc_id, filename, source_path, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("d0", "quimica.pdf", "/docs/quimica", "2026-01-01"),
+        )
+        self.conn.execute(
+            "INSERT INTO chunks(chunk_id, doc_id, ord, text, embed_text)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("k0", "d0", 0, "O pH mede a acidez da solução.", "O pH mede a acidez."),
+        )
+        self.conn.execute(
+            "INSERT INTO chunks(chunk_id, doc_id, ord, text, embed_text)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("k1", "d0", 1, "A lei de Ohm vale em CA e em CC.", "A lei de Ohm."),
+        )
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_acronyms_and_symbols_survive_the_short_word_cutoff(self):
+        self.assertEqual(fts_query("pH da solução tampão"),
+                         '"ph" OR "solucao" OR "tampao"')
+        self.assertEqual(fts_query("lei de Ohm em CA e CC"),
+                         '"lei" OR "ohm" OR "ca" OR "cc"')
+        self.assertEqual(fts_query("raios UV e luz IR"),
+                         '"raios" OR "uv" OR "luz" OR "ir"')
+        self.assertEqual(fts_query("5G vs 4G"), '"5g" OR "4g"')
+        # Palavra curta em minúscula continua fora, e o termo repetido entra uma vez.
+        self.assertEqual(fts_query("de da e em"), "")
+        self.assertEqual(fts_query("campo e campo"), '"campo"')
+
+    def test_short_term_finds_the_indexed_chunk(self):
+        self.assertEqual(
+            [chunk_id for chunk_id, _ in lexical_search("pH", 10, None, conn=self.conn)],
+            ["k0"],
+        )
+        self.assertEqual(
+            [chunk_id for chunk_id, _ in lexical_search("CC", 10, None, conn=self.conn)],
+            ["k1"],
+        )
+        # Sem termo nenhum o canal léxico não roda e a busca segue só vetorial.
+        self.assertEqual(lexical_search("ok", 10, None, conn=self.conn), [])
 
 
 if __name__ == "__main__":
