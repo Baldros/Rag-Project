@@ -10,6 +10,10 @@ Análise feita em 2026-10-23 sobre o branch `dev` deste repositório (commit `72
 `E:\MCPs\RAG-MCP` (commit `da7d406`), que expõe esta CLI como servidor MCP. Nenhum código foi
 alterado; os pontos marcados como "conferido" foram reproduzidos num store temporário.
 
+**Adotado em 2026-10-23:** os quatro pontos recomendados abaixo, mais as descrições de
+parâmetros no RAG-MCP. A análise fica como registro de como o código estava — a coluna
+"Situação aqui" descreve o estado anterior às mudanças, não o atual.
+
 ## O que mudou no WhatsApp Reader
 
 Commits do branch `windows-version` daquele repositório:

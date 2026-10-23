@@ -10,6 +10,11 @@ O SQLite guarda documentos, seções, chunks, collections, jobs e busca lexical
 `store/artifacts/` e permitem retomar uma ingestão sem converter o PDF de novo.
 `store/` não é versionado.
 
+O esquema do SQLite é versionado em `PRAGMA user_version`. Abrir o banco migra
+uma versão anterior e recusa, com `SCHEMA_TOO_NEW`, um banco gravado por código
+mais novo — em vez de rebaixar a marca e tratar como antigo um banco que já tem
+as mudanças.
+
 ## Instalação
 
 ```powershell
@@ -56,8 +61,10 @@ Para chamadas automatizadas, `off --no-wait` e `switch --no-wait` retornam
 ## CLI
 
 Saída padrão: JSON com `ok` e `data` ou `error` (`code`, `message`, `hint`).
-`--human` ou `-H` exibe uma versão legível. `-h` mostra a ajuda. Consultas leves
-funcionam mesmo com a sessão desligada e não importam PyTorch.
+As listagens acrescentam `page` (`limit`, `offset`, `has_more`) ao lado de
+`data`. `--human` ou `-H` exibe uma versão legível. `-h` descreve cada
+argumento. Consultas leves funcionam mesmo com a sessão desligada e não
+importam PyTorch.
 
 | Grupo | Comandos |
 |---|---|
@@ -86,10 +93,18 @@ python -m kb.cli jobs list --limit 10 --offset 0
 `status` consulta o driver da GPU sem carregar modelos. `doctor` faz a checagem
 mais profunda entre SQLite e índice vetorial. A base e os artefatos existentes
 permanecem no mesmo formato.
-As listagens aceitam `--limit` e `--offset` para paginação. Sem essas opções,
-collections e documentos continuam retornando a lista completa; jobs continuam
-limitados aos 10 mais recentes. Itens inexistentes retornam `NOT_FOUND` no
-envelope JSON da CLI.
+As listagens aceitam `--limit` e `--offset` para paginação, e `page.has_more`
+diz se a página esgotou a lista. Sem essas opções, collections e documentos
+continuam retornando a lista completa; jobs continuam limitados aos 10 mais
+recentes. Item inexistente retorna `NOT_FOUND` no envelope JSON da CLI, e isso
+vale para a collection pedida em `search`, `documents list` e
+`collections add-docs`: id errado é erro, não resultado vazio.
+
+Resposta cortada diz que foi cortada. A passagem devolvida por `search` traz
+`truncated` quando a seção passou de `KB_MAX_SECTION_CHARS` — leia-a inteira
+com `fetch --section-id` —, e `fetch` por páginas traz `truncated` e
+`next_page_start` quando o intervalo passou de `KB_FETCH_MAX_CHARS`. Esse corte
+só acontece ao virar de página, então ler em sequência sempre avança.
 
 ## Adapters de modelos
 
