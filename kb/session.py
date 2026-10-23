@@ -213,7 +213,8 @@ def _last_log_error() -> str | None:
     try:
         lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
         return next((line for line in reversed(lines) if line.startswith(
-            ("RuntimeError:", "ValueError:", "ImportError:", "ModuleNotFoundError:")
+            ("RuntimeError:", "ValueError:", "ImportError:", "ModuleNotFoundError:",
+             "kb.session.SessionError:")
         )), None)
     except OSError:
         return None
