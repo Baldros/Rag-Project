@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 from kb.db import get_conn, transaction
 from kb.utils import slugify
@@ -25,6 +25,22 @@ logger = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _not_found(collection_ids: Sequence[str]) -> NoReturn:
+    """
+    Collection inexistente é erro, não escopo vazio.
+
+    As duas coisas devolviam `ok` com zero resultados, indistinguível de "nada
+    relevante" para quem passou o nome em vez do id.
+    """
+    from kb.session import SessionError
+
+    raise SessionError(
+        "NOT_FOUND",
+        "collection não encontrada: " + ", ".join(sorted(collection_ids)),
+        "Use os ids de `kb collections list`",
+    )
 
 
 def create(
@@ -230,6 +246,7 @@ def resolve_scope(
     `None` significa "toda a base" — o índice vetorial roda sem filtro, que é o
     caminho mais rápido. Lista vazia significa "escopo válido, porém sem nenhum
     documento", e a busca deve retornar vazio em vez de cair para a base toda.
+    Collection inexistente, por outro lado, é `NOT_FOUND`.
     """
     conn = conn or get_conn()
 
@@ -240,12 +257,23 @@ def resolve_scope(
 
     if collections:
         placeholders = ",".join("?" * len(collections))
+        # O LEFT JOIN responde as duas perguntas numa consulta: a collection
+        # existe (veio linha) e quais documentos tem (doc_id não nulo).
         rows = conn.execute(
-            "SELECT DISTINCT doc_id FROM document_collections"
-            f" WHERE collection_id IN ({placeholders})",
+            f"""
+            SELECT c.collection_id, dc.doc_id
+            FROM collections c
+            LEFT JOIN document_collections dc ON dc.collection_id = c.collection_id
+            WHERE c.collection_id IN ({placeholders})
+            """,
             list(collections),
         ).fetchall()
-        resolved.extend(row["doc_id"] for row in rows)
+
+        missing = set(collections) - {row["collection_id"] for row in rows}
+        if missing:
+            _not_found(missing)
+
+        resolved.extend(row["doc_id"] for row in rows if row["doc_id"] is not None)
 
     return sorted(set(resolved))
 
@@ -316,6 +344,9 @@ def documents_in(
     conn = conn or get_conn()
 
     if collection_id:
+        if get(collection_id, conn=conn) is None:
+            _not_found([collection_id])
+
         query = """
             SELECT d.*
             FROM documents d

@@ -8,6 +8,7 @@ import sys
 import time
 from typing import Any
 
+from kb.config import FINAL_TOP_K
 from kb.session import SessionError
 
 
@@ -39,6 +40,14 @@ def _nonnegative_int(raw: str) -> int:
     if value < 0:
         raise argparse.ArgumentTypeError("Informe um inteiro não negativo")
     return value
+
+
+def _add_paging(parser: argparse.ArgumentParser, limit_default: int | None = None) -> None:
+    """Paginação das listagens, descrita num lugar só."""
+    parser.add_argument("--limit", type=_positive_int, default=limit_default, metavar="N",
+                        help="itens por página")
+    parser.add_argument("--offset", type=_nonnegative_int, default=0, metavar="N",
+                        help="itens a pular antes do primeiro desta página")
 
 
 def _wait_job(job_id: str) -> dict[str, Any]:
@@ -145,9 +154,13 @@ def _run(args: argparse.Namespace) -> Any:
             if not api.get(args.collection):
                 return _missing("collection", args.collection)
             return api.delete(args.collection, delete_documents=args.delete_documents)
-        if action == "add-docs":
-            return {"added": api.add_documents(args.collection, args.doc_ids)}
-        if action == "remove-docs":
+        if action in {"add-docs", "remove-docs"}:
+            # INSERT OR IGNORE e DELETE não reclamam de collection inexistente:
+            # sem esta checagem a escrita reporta sucesso sem ter feito nada.
+            if not api.get(args.collection):
+                return _missing("collection", args.collection)
+            if action == "add-docs":
+                return {"added": api.add_documents(args.collection, args.doc_ids)}
             return {"removed": api.remove_documents(args.collection, args.doc_ids)}
     if cmd == "documents":
         from kb import collection as api
@@ -182,81 +195,108 @@ def build_parser() -> JsonParser:
     parser = JsonParser(prog="kb", description="RAG local — ingestão e recuperação")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=JsonParser)
     p = sub.add_parser("on", help="liga sessão e carrega modelos")
-    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
+    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True,
+                   help="interaction carrega embedding e reranker; ingestion, o parser")
     p = sub.add_parser("off", help="desliga sessão e libera recursos")
-    p.add_argument("--cancel", action="store_true")
+    p.add_argument("--cancel", action="store_true",
+                   help="cancela o job ativo em vez de aguardá-lo")
     waiting = p.add_mutually_exclusive_group()
-    waiting.add_argument("--wait", action="store_true")
+    waiting.add_argument("--wait", action="store_true",
+                         help="aguarda o job ativo sem perguntar")
     waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     p = sub.add_parser("switch", help="troca explicitamente de modo")
-    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
-    p.add_argument("--cancel", action="store_true")
+    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True,
+                   help="modo de destino")
+    p.add_argument("--cancel", action="store_true",
+                   help="cancela o job ativo em vez de aguardá-lo")
     waiting = p.add_mutually_exclusive_group()
-    waiting.add_argument("--wait", action="store_true")
+    waiting.add_argument("--wait", action="store_true",
+                         help="aguarda o job ativo sem perguntar")
     waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     sub.add_parser("session", help="estado da sessão sem carregar modelos")
     p = sub.add_parser("search", help="busca híbrida em modo interaction")
-    p.add_argument("query")
-    p.add_argument("--collection", action="append")
-    p.add_argument("--doc-id", action="append")
-    p.add_argument("--top-k", type=int, default=5)
-    p.add_argument("--expand", choices=["section", "chunk"], default="section")
-    p.add_argument("--no-rerank", action="store_true")
+    p.add_argument("query", help="pergunta em linguagem natural")
+    p.add_argument("--collection", action="append", metavar="ID",
+                   help="id vindo de `collections list`, repetível; nome não serve")
+    p.add_argument("--doc-id", action="append", metavar="ID",
+                   help="id vindo de `documents list`, repetível")
+    p.add_argument("--top-k", type=_positive_int, default=FINAL_TOP_K, metavar="N",
+                   help=f"quantas passagens devolver (padrão {FINAL_TOP_K})")
+    p.add_argument("--expand", choices=["section", "chunk"], default="section",
+                   help="section devolve a seção-pai do acerto; chunk, o trecho cru")
+    p.add_argument("--no-rerank", action="store_true",
+                   help="pula o reranker: mais rápido e menos preciso")
     p = sub.add_parser("ingest", help="indexa PDFs em modo ingestion")
-    p.add_argument("paths", nargs="+")
-    p.add_argument("--collection")
-    p.add_argument("--collection-name")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-enrich", action="store_true")
-    p.add_argument("--background", action="store_true")
+    p.add_argument("paths", nargs="+",
+                   help="arquivos ou pastas de PDF, dentro das raízes permitidas")
+    p.add_argument("--collection", metavar="ID",
+                   help="collection de destino, criada se não existir")
+    p.add_argument("--collection-name", metavar="NOME",
+                   help="nome legível da collection, quando ela for criada")
+    p.add_argument("--force", action="store_true", help="reprocessa documento já indexado")
+    p.add_argument("--no-enrich", action="store_true", help="não gera resumos com o LLM")
+    p.add_argument("--background", action="store_true",
+                   help="devolve job_id em vez de aguardar o fim")
     p = sub.add_parser("reindex", help="reconstrói vetores em modo ingestion")
-    p.add_argument("--collection")
-    p.add_argument("--reset", action="store_true")
-    p.add_argument("--background", action="store_true")
+    p.add_argument("--collection", metavar="ID", help="limita a reindexação a uma collection")
+    p.add_argument("--reset", action="store_true",
+                   help="invalida os vetores existentes antes de reembedar")
+    p.add_argument("--background", action="store_true",
+                   help="devolve job_id em vez de aguardar o fim")
     p = sub.add_parser("fetch", help="lê seção ou páginas")
-    p.add_argument("--section-id")
-    p.add_argument("--doc-id")
-    p.add_argument("--page-start", type=int)
-    p.add_argument("--page-end", type=int)
+    p.add_argument("--section-id", metavar="ID", help="id de seção devolvido numa citação")
+    p.add_argument("--doc-id", metavar="ID", help="documento a ler por páginas")
+    p.add_argument("--page-start", type=_positive_int, metavar="N",
+                   help="primeira página do intervalo, a partir de 1")
+    p.add_argument("--page-end", type=_positive_int, metavar="N",
+                   help="última página do intervalo (padrão: a inicial)")
     p = sub.add_parser("outline", help="sumário navegável")
-    p.add_argument("doc_id")
-    p.add_argument("--max-depth", type=int, default=3)
+    p.add_argument("doc_id", help="id do documento")
+    p.add_argument("--max-depth", type=_positive_int, default=3, metavar="N",
+                   help="nível máximo de heading no sumário (padrão 3)")
     p = sub.add_parser("status", help="estado da base sem carregar modelos")
-    p.add_argument("--collection")
+    p.add_argument("--collection", metavar="ID", help="detalha uma collection pelo id")
     sub.add_parser("doctor", help="confere índice e artefatos")
     sub.add_parser("models", help="modelos e provedores configurados")
     p = sub.add_parser("collections", help="gerencia collections")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    item = actions.add_parser("list")
-    item.add_argument("--limit", type=_positive_int)
-    item.add_argument("--offset", type=_nonnegative_int, default=0)
-    for action in ("show", "create", "update", "delete", "add-docs", "remove-docs"):
-        item = actions.add_parser(action)
-        item.add_argument("collection")
+    _add_paging(actions.add_parser("list", help="lista collections e suas contagens"))
+    for action, summary in (
+        ("show", "mostra uma collection"),
+        ("create", "cria uma collection"),
+        ("update", "altera nome ou descrição"),
+        ("delete", "exclui uma collection"),
+        ("add-docs", "associa documentos a uma collection"),
+        ("remove-docs", "desfaz associações, sem excluir documentos"),
+    ):
+        item = actions.add_parser(action, help=summary)
+        item.add_argument("collection", help="id da collection")
         if action in {"create", "update"}:
-            item.add_argument("--name")
-            item.add_argument("--description")
+            item.add_argument("--name", metavar="NOME", help="nome legível")
+            item.add_argument("--description", metavar="TEXTO", help="descrição livre")
         if action == "delete":
-            item.add_argument("--delete-documents", action="store_true")
+            item.add_argument("--delete-documents", action="store_true",
+                              help="também apaga documentos que ficariam sem collection")
         if action in {"add-docs", "remove-docs"}:
-            item.add_argument("doc_ids", nargs="+")
+            item.add_argument("doc_ids", nargs="+", help="ids de documentos")
     p = sub.add_parser("documents", help="lista e gerencia documentos")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    item = actions.add_parser("list")
-    item.add_argument("--collection")
-    item.add_argument("--limit", type=_positive_int)
-    item.add_argument("--offset", type=_nonnegative_int, default=0)
-    actions.add_parser("show").add_argument("doc_id")
-    item = actions.add_parser("delete")
-    item.add_argument("doc_id")
-    item.add_argument("--purge-artifacts", action="store_true")
+    item = actions.add_parser("list", help="lista metadados de documentos")
+    item.add_argument("--collection", metavar="ID", help="filtra por collection")
+    _add_paging(item)
+    actions.add_parser("show", help="mostra um documento").add_argument(
+        "doc_id", help="id do documento")
+    item = actions.add_parser("delete", help="exclui documento, chunks e vetores")
+    item.add_argument("doc_id", help="id do documento")
+    item.add_argument("--purge-artifacts", action="store_true",
+                      help="também apaga os artefatos de parse em disco")
     p = sub.add_parser("jobs", help="progresso e cancelamento")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("show").add_argument("job_id")
-    actions.add_parser("cancel").add_argument("job_id")
-    item = actions.add_parser("list")
-    item.add_argument("--limit", type=_positive_int, default=10)
-    item.add_argument("--offset", type=_nonnegative_int, default=0)
+    actions.add_parser("show", help="mostra um job").add_argument("job_id", help="id do job")
+    actions.add_parser("cancel", help="cancela o job ativo").add_argument(
+        "job_id", help="id do job")
+    _add_paging(actions.add_parser("list", help="lista jobs, inclusive concluídos"),
+                limit_default=10)
     return parser
 
 

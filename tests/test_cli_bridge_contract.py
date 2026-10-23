@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -9,7 +10,7 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 
-from kb import cli, collection, db, jobs, session
+from kb import cli, collection, config, db, jobs, session
 from kb.retrieval.search import fts_query, lexical_search
 
 
@@ -119,6 +120,98 @@ class BridgeErrorTests(unittest.TestCase):
             "code": "BUSY", "message": "Job running", "hint": "Check job",
         })
         stop.assert_called_once_with(cancel=False, interactive=False, fail_if_busy=True)
+
+
+class ScopeContractTests(unittest.TestCase):
+    """A collection que não existe é erro; a vazia é escopo válido."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(db.SCHEMA)
+        self.conn.execute(
+            "INSERT INTO collections(collection_id, name, created_at) VALUES (?, ?, ?)",
+            ("fisica-3", "Física 3", "2026-01-01"),
+        )
+        self.conn.execute(
+            "INSERT INTO collections(collection_id, name, created_at) VALUES (?, ?, ?)",
+            ("vazia", "Sem documentos", "2026-01-01"),
+        )
+        self.conn.execute(
+            "INSERT INTO documents(doc_id, filename, source_path, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("d0", "livro.pdf", "/docs/livro", "2026-01-01"),
+        )
+        self.conn.execute(
+            "INSERT INTO document_collections(doc_id, collection_id, added_at)"
+            " VALUES (?, ?, ?)",
+            ("d0", "fisica-3", "2026-01-01"),
+        )
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_name_instead_of_id_is_not_found_but_empty_collection_is_a_scope(self):
+        self.assertIsNone(collection.resolve_scope(conn=self.conn))
+        self.assertEqual(collection.resolve_scope(["fisica-3"], conn=self.conn), ["d0"])
+        self.assertEqual(collection.resolve_scope(["vazia"], conn=self.conn), [])
+
+        for absent in (["Física 3"], ["fisica3"], ["fisica-3", "fisica3"]):
+            with self.assertRaises(session.SessionError) as raised:
+                collection.resolve_scope(absent, conn=self.conn)
+            self.assertEqual(raised.exception.code, "NOT_FOUND")
+
+    def test_document_listing_refuses_an_unknown_collection(self):
+        self.assertEqual(collection.documents_in("vazia", conn=self.conn), [])
+        with self.assertRaises(session.SessionError) as raised:
+            collection.documents_in("fisica3", conn=self.conn)
+        self.assertEqual(raised.exception.code, "NOT_FOUND")
+
+        with patch.object(collection, "get_conn", return_value=self.conn):
+            code, result = invoke("documents", "list", "--collection", "fisica3")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["error"]["code"], "NOT_FOUND")
+
+    def test_writing_to_an_unknown_collection_is_refused(self):
+        with patch.object(collection, "get_conn", return_value=self.conn):
+            code, result = invoke("collections", "add-docs", "fisica3", "d0")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["error"]["code"], "NOT_FOUND")
+
+
+class ArgumentValidationTests(unittest.TestCase):
+    """A CLI é a interface pública: valor inválido falha antes de virar slice."""
+
+    def test_sizes_and_pages_must_be_positive(self):
+        for args in (
+            ("search", "x", "--top-k", "-1"),
+            ("search", "x", "--top-k", "0"),
+            ("outline", "x", "--max-depth", "0"),
+            ("fetch", "--doc-id", "x", "--page-start", "0"),
+            ("fetch", "--doc-id", "x", "--page-start", "1", "--page-end", "-2"),
+        ):
+            code, result = invoke(*args)
+            self.assertEqual(code, 2, args)
+            self.assertEqual(result["error"]["code"], "USAGE_ERROR", args)
+
+    def test_search_defaults_follow_the_configured_top_k(self):
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["search", "x"]).top_k, config.FINAL_TOP_K)
+
+    def test_every_argument_is_documented(self):
+        parser = cli.build_parser()
+        missing = []
+
+        def walk(node, path):
+            for action in node._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for name, child in action.choices.items():
+                        walk(child, f"{path} {name}")
+                elif action.help is None:
+                    missing.append(f"{path} {action.dest}")
+
+        walk(parser, "kb")
+        self.assertEqual(missing, [])
 
 
 class LexicalQueryTests(unittest.TestCase):
