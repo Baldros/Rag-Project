@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 from kb import cli, collection, config, db, jobs, session
-from kb.retrieval.search import fts_query, lexical_search
+from kb.retrieval import fetch_pages
+from kb.retrieval.expand import expand_to_sections
+from kb.retrieval.search import Hit, fts_query, lexical_search
 
 
 def invoke(*args: str) -> tuple[int, dict]:
@@ -65,6 +67,135 @@ class CatalogPaginationTests(unittest.TestCase):
         code, result = invoke("documents", "list", "--limit", "0")
         self.assertEqual(code, 2)
         self.assertEqual(result["error"]["code"], "USAGE_ERROR")
+
+
+class PageSignalTests(unittest.TestCase):
+    """Listagem cheia é indistinguível do fim da lista sem page.has_more."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(db.SCHEMA)
+        for index in range(3):
+            self.conn.execute(
+                "INSERT INTO collections(collection_id, name, created_at) VALUES (?, ?, ?)",
+                (f"c{index}", f"Collection {index}", "2026-01-01"),
+            )
+            self.conn.execute(
+                "INSERT INTO documents(doc_id, filename, source_path, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (f"d{index}", f"document-{index}.pdf", f"/docs/{index}", "2026-01-01"),
+            )
+            self.conn.execute(
+                "INSERT INTO jobs(job_id, kind, status, created_at) VALUES (?, ?, ?, ?)",
+                (f"j{index}", "ingest", "done", f"2026-01-0{index + 1}"),
+            )
+
+    def tearDown(self):
+        self.conn.close()
+
+    def listing(self, *args: str) -> tuple[int, dict]:
+        with patch.object(collection, "get_conn", return_value=self.conn),              patch.object(jobs, "get_conn", return_value=self.conn):
+            return invoke(*args)
+
+    def test_surplus_row_becomes_has_more(self):
+        for command in (("collections", "list"), ("documents", "list"), ("jobs", "list")):
+            code, result = self.listing(*command, "--limit", "2")
+            self.assertEqual(code, 0, command)
+            self.assertEqual(len(result["data"]), 2, command)
+            self.assertEqual(result["page"],
+                             {"limit": 2, "offset": 0, "has_more": True}, command)
+
+            code, result = self.listing(*command, "--limit", "2", "--offset", "2")
+            self.assertEqual(len(result["data"]), 1, command)
+            self.assertEqual(result["page"],
+                             {"limit": 2, "offset": 2, "has_more": False}, command)
+
+    def test_unbounded_listing_keeps_data_a_list_and_reports_no_more(self):
+        code, result = self.listing("collections", "list")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(result["data"]), 3)
+        self.assertEqual(result["data"][0]["collection_id"], "c0")
+        self.assertEqual(result["page"], {"limit": None, "offset": 0, "has_more": False})
+
+    def test_human_output_says_where_to_continue(self):
+        output = io.StringIO()
+        with patch.object(collection, "get_conn", return_value=self.conn),              contextlib.redirect_stdout(output):
+            cli.main(["collections", "list", "--limit", "2", "-H"])
+        self.assertIn("--offset 2", output.getvalue())
+
+
+class IncompleteReadTests(unittest.TestCase):
+    """Corte de texto é informado em campo, não só no meio do texto."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(db.SCHEMA)
+        self.conn.execute(
+            "INSERT INTO documents(doc_id, filename, source_path, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("d0", "livro.pdf", "/docs/livro", "2026-01-01"),
+        )
+
+    def tearDown(self):
+        self.conn.close()
+
+    def add_chunk(self, ord_: int, page: int, size: int) -> None:
+        self.conn.execute(
+            "INSERT INTO chunks(chunk_id, doc_id, ord, page_start, page_end,"
+            " heading_path, text, embed_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"k{ord_}", "d0", ord_, page, page, f"Capítulo {page}",
+             "x" * size, "x" * size),
+        )
+
+    def test_long_range_is_cut_at_a_page_boundary_with_the_next_page(self):
+        for ord_, page in enumerate([1, 2, 3, 4]):
+            self.add_chunk(ord_, page, 1000)
+
+        first = fetch_pages("d0", 1, 4, max_chars=1500, conn=self.conn)
+        self.assertEqual(first["n_chunks"], 2)
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["next_page_start"], 3)
+
+        rest = fetch_pages("d0", first["next_page_start"], 4, max_chars=1500,
+                           conn=self.conn)
+        self.assertEqual(rest["n_chunks"], 2)
+        self.assertFalse(rest["truncated"])
+        self.assertIsNone(rest["next_page_start"])
+
+    def test_a_single_page_is_never_split_so_reading_always_advances(self):
+        for ord_ in range(3):
+            self.add_chunk(ord_, 1, 1000)
+
+        result = fetch_pages("d0", 1, 1, max_chars=500, conn=self.conn)
+        self.assertEqual(result["n_chunks"], 3)
+        self.assertFalse(result["truncated"])
+        self.assertIsNone(result["next_page_start"])
+
+    def test_short_range_reports_no_truncation(self):
+        self.add_chunk(0, 1, 100)
+        result = fetch_pages("d0", 1, conn=self.conn)
+        self.assertFalse(result["truncated"])
+        self.assertIsNone(result["next_page_start"])
+
+    def test_cut_section_is_flagged_for_a_follow_up_fetch(self):
+        self.conn.execute(
+            "INSERT INTO sections(section_id, doc_id, ord, heading, heading_path,"
+            " page_start, page_end, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s0", "d0", 0, "Campo elétrico", "Campo elétrico", 1, 2, "y" * 400),
+        )
+        hit = Hit(chunk_id="k0", doc_id="d0", section_id="s0", text="y" * 20,
+                  heading_path="Campo elétrico", page_start=1, page_end=1,
+                  content_type="text", filename="livro.pdf")
+
+        cut = expand_to_sections([hit], max_chars=100, conn=self.conn)[0].to_dict()
+        self.assertTrue(cut["truncated"])
+        self.assertEqual(cut["section_id"], "s0")
+
+        whole = expand_to_sections([hit], max_chars=4000, conn=self.conn)[0].to_dict()
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(len(whole["text"]), 400)
 
 
 class BridgeErrorTests(unittest.TestCase):

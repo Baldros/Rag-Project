@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 from kb.config import FINAL_TOP_K
 from kb.session import SessionError
@@ -42,10 +42,34 @@ def _nonnegative_int(raw: str) -> int:
     return value
 
 
+class Paged(NamedTuple):
+    """Uma página de listagem e o que o cliente precisa para pedir a próxima."""
+
+    data: list[Any]
+    page: dict[str, Any]
+
+
+def _one_extra(limit: int | None) -> int | None:
+    """Pede uma linha além da página, que é o que prova que havia mais itens."""
+    return None if limit is None else limit + 1
+
+
+def _paged(rows: list[Any], limit: int | None, offset: int) -> Paged:
+    """
+    Separa a página da linha excedente lida por `_one_extra`.
+
+    Sem isso uma listagem cheia é indistinguível do fim da lista, e o cliente
+    resume meia base como se fosse a base toda.
+    """
+    has_more = limit is not None and len(rows) > limit
+    return Paged(rows[:limit] if has_more else rows,
+                 {"limit": limit, "offset": offset, "has_more": has_more})
+
+
 def _add_paging(parser: argparse.ArgumentParser, limit_default: int | None = None) -> None:
     """Paginação das listagens, descrita num lugar só."""
     parser.add_argument("--limit", type=_positive_int, default=limit_default, metavar="N",
-                        help="itens por página")
+                        help="itens por página; a resposta traz page.has_more")
     parser.add_argument("--offset", type=_nonnegative_int, default=0, metavar="N",
                         help="itens a pular antes do primeiro desta página")
 
@@ -141,7 +165,10 @@ def _run(args: argparse.Namespace) -> Any:
 
         action = args.action
         if action == "list":
-            return api.list_all(limit=args.limit, offset=args.offset)
+            return _paged(
+                api.list_all(limit=_one_extra(args.limit), offset=args.offset),
+                args.limit, args.offset,
+            )
         if action == "show":
             return api.get(args.collection) or _missing("collection", args.collection)
         if action == "create":
@@ -166,7 +193,11 @@ def _run(args: argparse.Namespace) -> Any:
         from kb import collection as api
 
         if args.action == "list":
-            return api.documents_in(args.collection, limit=args.limit, offset=args.offset)
+            return _paged(
+                api.documents_in(args.collection, limit=_one_extra(args.limit),
+                                 offset=args.offset),
+                args.limit, args.offset,
+            )
         if args.action == "show":
             from kb.db import get_conn
 
@@ -180,7 +211,8 @@ def _run(args: argparse.Namespace) -> Any:
         from kb.jobs import get_job, list_jobs
 
         if args.action == "list":
-            return list_jobs(args.limit, offset=args.offset)
+            return _paged(list_jobs(_one_extra(args.limit), offset=args.offset),
+                          args.limit, args.offset)
         if args.action == "show":
             return get_job(args.job_id) or _missing("job", args.job_id)
         if args.action == "cancel":
@@ -300,13 +332,16 @@ def build_parser() -> JsonParser:
     return parser
 
 
-def _human(data: Any) -> str:
+def _human(data: Any, page: dict[str, Any] | None = None) -> str:
     if isinstance(data, dict) and "results" in data:
         return "\n\n".join(
             f"{item['filename']} | p. {item['pages']}\n{item['heading_path']}\n{item['text']}"
             for item in data["results"]
         ) or "Nenhum resultado"
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    if page and page["has_more"]:
+        text += f"\n\nHá mais itens: repita com --offset {page['offset'] + page['limit']}."
+    return text
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -327,7 +362,20 @@ def main(argv: list[str] | None = None) -> int:
             "code": "OPERATION_FAILED", "message": str(exc),
         }}))
         return 1
-    print(_human(data) if human else json.dumps({"ok": True, "data": data}, default=str))
+
+    page = None
+    if isinstance(data, Paged):
+        data, page = data.data, data.page
+
+    if human:
+        print(_human(data, page))
+        return 0
+
+    envelope: dict[str, Any] = {"ok": True, "data": data}
+    if page is not None:
+        envelope["page"] = page
+
+    print(json.dumps(envelope, default=str))
     return 0
 
 
