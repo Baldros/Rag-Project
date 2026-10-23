@@ -169,6 +169,19 @@ def _schema_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
+def _create_schema(conn: sqlite3.Connection) -> None:
+    """Executa o esquema sem o COMMIT implícito de `executescript`."""
+    statement = ""
+    for line in SCHEMA.splitlines(keepends=True):
+        statement += line
+        # complete_statement mantém cada trigger inteiro, incluindo seus `;`.
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("Instrução incompleta no esquema SQLite")
+
+
 def _upgrade(conn: sqlite3.Connection, version: int) -> None:
     """
     Passos de migração de um banco existente, da menor versão para a maior.
@@ -183,9 +196,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     Sobe o banco até SCHEMA_VERSION.
 
-    Versão 0 é banco cujo esquema o `SCHEMA` acabou de criar: já está no
-    formato atual e só falta a marca. De 1 em diante existe forma antiga a
-    converter, e é aí que `_upgrade` entra.
+    Versão 0 é banco novo ou sem marca: cria o esquema atual. De 1 em diante
+    existe forma antiga a converter, e é aí que `_upgrade` entra.
 
     `BEGIN IMMEDIATE` porque a sessão (`kb.runtime`) e a CLI abrem o mesmo
     arquivo em processos diferentes: quem perder a corrida relê a versão já
@@ -195,10 +207,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
     with transaction(conn, immediate=True):
         version = _schema_version(conn)
 
-        if version >= SCHEMA_VERSION:
+        if version > SCHEMA_VERSION:
+            from kb.session import SessionError
+
+            raise SessionError(
+                "SCHEMA_TOO_NEW",
+                f"Banco na versão {version}; este código entende até {SCHEMA_VERSION}",
+                "Atualize o código do RAG ou aponte KB_STORE_DIR para outro store",
+            )
+
+        if version == SCHEMA_VERSION:
             return  # Outro processo migrou enquanto esperávamos o lock.
 
-        if version > 0:
+        if version == 0:
+            _create_schema(conn)
+        else:
             _upgrade(conn, version)
 
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -218,21 +241,7 @@ def init_db(path: Path | str | None = None) -> sqlite3.Connection:
     conn = connect(path)
 
     try:
-        version = _schema_version(conn)
-
-        if version > SCHEMA_VERSION:
-            from kb.session import SessionError
-
-            raise SessionError(
-                "SCHEMA_TOO_NEW",
-                f"Banco na versão {version}; este código entende até {SCHEMA_VERSION}",
-                "Atualize o código do RAG ou aponte KB_STORE_DIR para outro store",
-            )
-
-        conn.executescript(SCHEMA)
-
-        if version < SCHEMA_VERSION:
-            _migrate(conn)
+        _migrate(conn)
     except BaseException:
         conn.close()
         raise
@@ -276,7 +285,7 @@ def transaction(
     conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
-    except Exception:
+    except BaseException:
         conn.execute("ROLLBACK")
         raise
     else:
