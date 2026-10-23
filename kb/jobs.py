@@ -140,10 +140,11 @@ def active_jobs(
     return active
 
 
-def list_jobs(limit: int = 10, conn=None) -> list[dict[str, Any]]:
+def list_jobs(limit: int = 10, conn=None, offset: int = 0) -> list[dict[str, Any]]:
     conn = conn or get_conn()
     rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        "SELECT * FROM jobs ORDER BY created_at DESC, job_id DESC LIMIT ? OFFSET ?",
+        (limit, offset),
     ).fetchall()
 
     return [dict(row) for row in rows]

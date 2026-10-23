@@ -156,6 +156,10 @@ RRF_K = 60
 # Teto de caracteres por seção devolvida na expansão small-to-big.
 MAX_SECTION_CHARS = int(os.getenv("KB_MAX_SECTION_CHARS", "12000"))
 
+# Teto de caracteres por leitura de páginas. Um intervalo grande volta em
+# partes, com a próxima página a pedir, em vez de uma resposta única enorme.
+FETCH_MAX_CHARS = int(os.getenv("KB_FETCH_MAX_CHARS", "24000"))
+
 
 # =========================
 # Logging

@@ -40,6 +40,7 @@ class Passage:
     content_type: str
     scores: dict[str, float]
     matched_chunks: int = 1
+    truncated: bool = False
 
     @property
     def pages(self) -> str:
@@ -58,6 +59,7 @@ class Passage:
             "pages": self.pages,
             "content_type": self.content_type,
             "matched_chunks": self.matched_chunks,
+            "truncated": self.truncated,
             "scores": self.scores,
             "text": self.text,
         }
@@ -95,6 +97,9 @@ def expand_to_sections(
                 scores=hit.scores,
             )
         else:
+            # O `[...]` que `truncate` insere fica no texto, mas o cliente não
+            # deveria ter de procurá-lo para saber que vale um `fetch` da seção.
+            full = section["text"] or hit.text
             passage = Passage(
                 doc_id=hit.doc_id,
                 filename=hit.filename,
@@ -102,9 +107,10 @@ def expand_to_sections(
                 heading_path=section["heading_path"] or hit.heading_path,
                 page_start=section["page_start"],
                 page_end=section["page_end"],
-                text=truncate(section["text"] or hit.text, max_chars),
+                text=truncate(full, max_chars),
                 content_type=hit.content_type,
                 scores=hit.scores,
+                truncated=len(full) > max_chars,
             )
             seen[section["section_id"]] = passage
 

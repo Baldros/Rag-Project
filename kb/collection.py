@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 from kb.db import get_conn, transaction
 from kb.utils import slugify
@@ -25,6 +25,22 @@ logger = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _not_found(collection_ids: Sequence[str]) -> NoReturn:
+    """
+    Collection inexistente é erro, não escopo vazio.
+
+    As duas coisas devolviam `ok` com zero resultados, indistinguível de "nada
+    relevante" para quem passou o nome em vez do id.
+    """
+    from kb.session import SessionError
+
+    raise SessionError(
+        "NOT_FOUND",
+        "collection não encontrada: " + ", ".join(sorted(collection_ids)),
+        "Use os ids de `kb collections list`",
+    )
 
 
 def create(
@@ -65,12 +81,12 @@ def get(
     return dict(row) if row else None
 
 
-def list_all(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+def list_all(conn: sqlite3.Connection | None = None, limit: int | None = None,
+             offset: int = 0) -> list[dict[str, Any]]:
     """Collections com contagens, para o agente saber o que existe."""
     conn = conn or get_conn()
 
-    rows = conn.execute(
-        """
+    query = """
         SELECT c.collection_id,
                c.name,
                c.description,
@@ -82,9 +98,13 @@ def list_all(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
         LEFT JOIN document_collections dc ON dc.collection_id = c.collection_id
         LEFT JOIN documents d             ON d.doc_id = dc.doc_id
         GROUP BY c.collection_id
-        ORDER BY c.name
+        ORDER BY c.name, c.collection_id
         """
-    ).fetchall()
+    if limit is not None or offset:
+        query += " LIMIT ? OFFSET ?"
+        rows = conn.execute(query, (limit if limit is not None else -1, offset)).fetchall()
+    else:
+        rows = conn.execute(query).fetchall()
 
     return [dict(row) for row in rows]
 
@@ -226,6 +246,7 @@ def resolve_scope(
     `None` significa "toda a base" — o índice vetorial roda sem filtro, que é o
     caminho mais rápido. Lista vazia significa "escopo válido, porém sem nenhum
     documento", e a busca deve retornar vazio em vez de cair para a base toda.
+    Collection inexistente, por outro lado, é `NOT_FOUND`.
     """
     conn = conn or get_conn()
 
@@ -236,12 +257,23 @@ def resolve_scope(
 
     if collections:
         placeholders = ",".join("?" * len(collections))
+        # O LEFT JOIN responde as duas perguntas numa consulta: a collection
+        # existe (veio linha) e quais documentos tem (doc_id não nulo).
         rows = conn.execute(
-            "SELECT DISTINCT doc_id FROM document_collections"
-            f" WHERE collection_id IN ({placeholders})",
+            f"""
+            SELECT c.collection_id, dc.doc_id
+            FROM collections c
+            LEFT JOIN document_collections dc ON dc.collection_id = c.collection_id
+            WHERE c.collection_id IN ({placeholders})
+            """,
             list(collections),
         ).fetchall()
-        resolved.extend(row["doc_id"] for row in rows)
+
+        missing = set(collections) - {row["collection_id"] for row in rows}
+        if missing:
+            _not_found(missing)
+
+        resolved.extend(row["doc_id"] for row in rows if row["doc_id"] is not None)
 
     return sorted(set(resolved))
 
@@ -305,22 +337,31 @@ def delete_document(
 def documents_in(
     collection_id: str | None = None,
     conn: sqlite3.Connection | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Catálogo de documentos, opcionalmente filtrado por collection."""
     conn = conn or get_conn()
 
     if collection_id:
-        rows = conn.execute(
-            """
+        if get(collection_id, conn=conn) is None:
+            _not_found([collection_id])
+
+        query = """
             SELECT d.*
             FROM documents d
             JOIN document_collections dc ON dc.doc_id = d.doc_id
             WHERE dc.collection_id = ?
-            ORDER BY d.filename
-            """,
-            (collection_id,),
-        ).fetchall()
+            ORDER BY d.filename, d.doc_id
+            """
+        params: list[Any] = [collection_id]
     else:
-        rows = conn.execute("SELECT * FROM documents ORDER BY filename").fetchall()
+        query = "SELECT * FROM documents ORDER BY filename, doc_id"
+        params = []
+
+    if limit is not None or offset:
+        query += " LIMIT ? OFFSET ?"
+        params.extend((limit if limit is not None else -1, offset))
+    rows = conn.execute(query, params).fetchall()
 
     return [dict(row) for row in rows]

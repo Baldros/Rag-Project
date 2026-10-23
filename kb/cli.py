@@ -6,8 +6,9 @@ import argparse
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
+from kb.config import FINAL_TOP_K
 from kb.session import SessionError
 
 
@@ -19,6 +20,58 @@ class JsonParser(argparse.ArgumentParser):
 
 def _missing(kind: str, identifier: str):
     raise SessionError("NOT_FOUND", f"{kind} não encontrado: {identifier}")
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Informe um inteiro maior que zero") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("Informe um inteiro maior que zero")
+    return value
+
+
+def _nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Informe um inteiro não negativo") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("Informe um inteiro não negativo")
+    return value
+
+
+class Paged(NamedTuple):
+    """Uma página de listagem e o que o cliente precisa para pedir a próxima."""
+
+    data: list[Any]
+    page: dict[str, Any]
+
+
+def _one_extra(limit: int | None) -> int | None:
+    """Pede uma linha além da página, que é o que prova que havia mais itens."""
+    return None if limit is None else limit + 1
+
+
+def _paged(rows: list[Any], limit: int | None, offset: int) -> Paged:
+    """
+    Separa a página da linha excedente lida por `_one_extra`.
+
+    Sem isso uma listagem cheia é indistinguível do fim da lista, e o cliente
+    resume meia base como se fosse a base toda.
+    """
+    has_more = limit is not None and len(rows) > limit
+    return Paged(rows[:limit] if has_more else rows,
+                 {"limit": limit, "offset": offset, "has_more": has_more})
+
+
+def _add_paging(parser: argparse.ArgumentParser, limit_default: int | None = None) -> None:
+    """Paginação das listagens, descrita num lugar só."""
+    parser.add_argument("--limit", type=_positive_int, default=limit_default, metavar="N",
+                        help="itens por página; a resposta traz page.has_more")
+    parser.add_argument("--offset", type=_nonnegative_int, default=0, metavar="N",
+                        help="itens a pular antes do primeiro desta página")
 
 
 def _wait_job(job_id: str) -> dict[str, Any]:
@@ -47,9 +100,12 @@ def _run(args: argparse.Namespace) -> Any:
     if cmd == "on":
         return session.start(args.mode)
     if cmd == "off":
-        return session.stop(cancel=args.cancel, interactive=not args.wait)
+        return session.stop(cancel=args.cancel, interactive=not (args.wait or args.no_wait),
+                            fail_if_busy=args.no_wait)
     if cmd == "switch":
-        return session.switch(args.mode, cancel=args.cancel, interactive=not args.wait)
+        return session.switch(args.mode, cancel=args.cancel,
+                              interactive=not (args.wait or args.no_wait),
+                              fail_if_busy=args.no_wait)
     if cmd == "session":
         return session.status()
     if cmd == "search":
@@ -75,15 +131,20 @@ def _run(args: argparse.Namespace) -> Any:
             return fetch_section(args.section_id) or _missing("seção", args.section_id)
         if not args.doc_id or args.page_start is None:
             raise SessionError("USAGE_ERROR", "Informe --section-id ou --doc-id e --page-start")
-        return fetch_pages(args.doc_id, args.page_start, args.page_end)
+        result = fetch_pages(args.doc_id, args.page_start, args.page_end)
+        return result if result["filename"] is not None else _missing("documento", args.doc_id)
     if cmd == "outline":
         from kb.retrieval import get_outline
 
-        return get_outline(args.doc_id, max_depth=args.max_depth)
+        result = get_outline(args.doc_id, max_depth=args.max_depth)
+        return result if "error" not in result else _missing("documento", args.doc_id)
     if cmd == "status":
         from kb.health import status
 
-        return status(args.collection)
+        result = status(args.collection)
+        if args.collection and "error" in result.get("collection", {}):
+            return _missing("collection", args.collection)
+        return result
     if cmd == "doctor":
         from kb.health import consistency, orphan_artifacts
 
@@ -104,7 +165,10 @@ def _run(args: argparse.Namespace) -> Any:
 
         action = args.action
         if action == "list":
-            return api.list_all()
+            return _paged(
+                api.list_all(limit=_one_extra(args.limit), offset=args.offset),
+                args.limit, args.offset,
+            )
         if action == "show":
             return api.get(args.collection) or _missing("collection", args.collection)
         if action == "create":
@@ -114,16 +178,26 @@ def _run(args: argparse.Namespace) -> Any:
             return api.update(args.collection, args.name, args.description) or _missing(
                 "collection", args.collection)
         if action == "delete":
+            if not api.get(args.collection):
+                return _missing("collection", args.collection)
             return api.delete(args.collection, delete_documents=args.delete_documents)
-        if action == "add-docs":
-            return {"added": api.add_documents(args.collection, args.doc_ids)}
-        if action == "remove-docs":
+        if action in {"add-docs", "remove-docs"}:
+            # INSERT OR IGNORE e DELETE não reclamam de collection inexistente:
+            # sem esta checagem a escrita reporta sucesso sem ter feito nada.
+            if not api.get(args.collection):
+                return _missing("collection", args.collection)
+            if action == "add-docs":
+                return {"added": api.add_documents(args.collection, args.doc_ids)}
             return {"removed": api.remove_documents(args.collection, args.doc_ids)}
     if cmd == "documents":
         from kb import collection as api
 
         if args.action == "list":
-            return api.documents_in(args.collection)
+            return _paged(
+                api.documents_in(args.collection, limit=_one_extra(args.limit),
+                                 offset=args.offset),
+                args.limit, args.offset,
+            )
         if args.action == "show":
             from kb.db import get_conn
 
@@ -131,12 +205,14 @@ def _run(args: argparse.Namespace) -> Any:
                                      (args.doc_id,)).fetchone()
             return dict(row) if row else _missing("documento", args.doc_id)
         if args.action == "delete":
-            return api.delete_document(args.doc_id, purge_artifacts=args.purge_artifacts)
+            result = api.delete_document(args.doc_id, purge_artifacts=args.purge_artifacts)
+            return result if result["ok"] else _missing("documento", args.doc_id)
     if cmd == "jobs":
         from kb.jobs import get_job, list_jobs
 
         if args.action == "list":
-            return list_jobs(args.limit)
+            return _paged(list_jobs(_one_extra(args.limit), offset=args.offset),
+                          args.limit, args.offset)
         if args.action == "show":
             return get_job(args.job_id) or _missing("job", args.job_id)
         if args.action == "cancel":
@@ -151,80 +227,121 @@ def build_parser() -> JsonParser:
     parser = JsonParser(prog="kb", description="RAG local — ingestão e recuperação")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=JsonParser)
     p = sub.add_parser("on", help="liga sessão e carrega modelos")
-    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
+    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True,
+                   help="interaction carrega embedding e reranker; ingestion, o parser")
     p = sub.add_parser("off", help="desliga sessão e libera recursos")
-    p.add_argument("--cancel", action="store_true")
-    p.add_argument("--wait", action="store_true")
+    p.add_argument("--cancel", action="store_true",
+                   help="cancela o job ativo em vez de aguardá-lo")
+    waiting = p.add_mutually_exclusive_group()
+    waiting.add_argument("--wait", action="store_true",
+                         help="aguarda o job ativo sem perguntar")
+    waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     p = sub.add_parser("switch", help="troca explicitamente de modo")
-    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True)
-    p.add_argument("--cancel", action="store_true")
-    p.add_argument("--wait", action="store_true")
+    p.add_argument("--mode", choices=["interaction", "ingestion"], required=True,
+                   help="modo de destino")
+    p.add_argument("--cancel", action="store_true",
+                   help="cancela o job ativo em vez de aguardá-lo")
+    waiting = p.add_mutually_exclusive_group()
+    waiting.add_argument("--wait", action="store_true",
+                         help="aguarda o job ativo sem perguntar")
+    waiting.add_argument("--no-wait", action="store_true", help="retorna BUSY se houver job ativo")
     sub.add_parser("session", help="estado da sessão sem carregar modelos")
     p = sub.add_parser("search", help="busca híbrida em modo interaction")
-    p.add_argument("query")
-    p.add_argument("--collection", action="append")
-    p.add_argument("--doc-id", action="append")
-    p.add_argument("--top-k", type=int, default=5)
-    p.add_argument("--expand", choices=["section", "chunk"], default="section")
-    p.add_argument("--no-rerank", action="store_true")
+    p.add_argument("query", help="pergunta em linguagem natural")
+    p.add_argument("--collection", action="append", metavar="ID",
+                   help="id vindo de `collections list`, repetível; nome não serve")
+    p.add_argument("--doc-id", action="append", metavar="ID",
+                   help="id vindo de `documents list`, repetível")
+    p.add_argument("--top-k", type=_positive_int, default=FINAL_TOP_K, metavar="N",
+                   help=f"quantas passagens devolver (padrão {FINAL_TOP_K})")
+    p.add_argument("--expand", choices=["section", "chunk"], default="section",
+                   help="section devolve a seção-pai do acerto; chunk, o trecho cru")
+    p.add_argument("--no-rerank", action="store_true",
+                   help="pula o reranker: mais rápido e menos preciso")
     p = sub.add_parser("ingest", help="indexa PDFs em modo ingestion")
-    p.add_argument("paths", nargs="+")
-    p.add_argument("--collection")
-    p.add_argument("--collection-name")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-enrich", action="store_true")
-    p.add_argument("--background", action="store_true")
+    p.add_argument("paths", nargs="+",
+                   help="arquivos ou pastas de PDF, dentro das raízes permitidas")
+    p.add_argument("--collection", metavar="ID",
+                   help="collection de destino, criada se não existir")
+    p.add_argument("--collection-name", metavar="NOME",
+                   help="nome legível da collection, quando ela for criada")
+    p.add_argument("--force", action="store_true", help="reprocessa documento já indexado")
+    p.add_argument("--no-enrich", action="store_true", help="não gera resumos com o LLM")
+    p.add_argument("--background", action="store_true",
+                   help="devolve job_id em vez de aguardar o fim")
     p = sub.add_parser("reindex", help="reconstrói vetores em modo ingestion")
-    p.add_argument("--collection")
-    p.add_argument("--reset", action="store_true")
-    p.add_argument("--background", action="store_true")
+    p.add_argument("--collection", metavar="ID", help="limita a reindexação a uma collection")
+    p.add_argument("--reset", action="store_true",
+                   help="invalida os vetores existentes antes de reembedar")
+    p.add_argument("--background", action="store_true",
+                   help="devolve job_id em vez de aguardar o fim")
     p = sub.add_parser("fetch", help="lê seção ou páginas")
-    p.add_argument("--section-id")
-    p.add_argument("--doc-id")
-    p.add_argument("--page-start", type=int)
-    p.add_argument("--page-end", type=int)
+    p.add_argument("--section-id", metavar="ID", help="id de seção devolvido numa citação")
+    p.add_argument("--doc-id", metavar="ID", help="documento a ler por páginas")
+    p.add_argument("--page-start", type=_positive_int, metavar="N",
+                   help="primeira página do intervalo, a partir de 1")
+    p.add_argument("--page-end", type=_positive_int, metavar="N",
+                   help="última página do intervalo (padrão: a inicial)")
     p = sub.add_parser("outline", help="sumário navegável")
-    p.add_argument("doc_id")
-    p.add_argument("--max-depth", type=int, default=3)
+    p.add_argument("doc_id", help="id do documento")
+    p.add_argument("--max-depth", type=_positive_int, default=3, metavar="N",
+                   help="nível máximo de heading no sumário (padrão 3)")
     p = sub.add_parser("status", help="estado da base sem carregar modelos")
-    p.add_argument("--collection")
+    p.add_argument("--collection", metavar="ID", help="detalha uma collection pelo id")
     sub.add_parser("doctor", help="confere índice e artefatos")
     sub.add_parser("models", help="modelos e provedores configurados")
     p = sub.add_parser("collections", help="gerencia collections")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("list")
-    for action in ("show", "create", "update", "delete", "add-docs", "remove-docs"):
-        item = actions.add_parser(action)
-        item.add_argument("collection")
+    _add_paging(actions.add_parser("list", help="lista collections e suas contagens"))
+    for action, summary in (
+        ("show", "mostra uma collection"),
+        ("create", "cria uma collection"),
+        ("update", "altera nome ou descrição"),
+        ("delete", "exclui uma collection"),
+        ("add-docs", "associa documentos a uma collection"),
+        ("remove-docs", "desfaz associações, sem excluir documentos"),
+    ):
+        item = actions.add_parser(action, help=summary)
+        item.add_argument("collection", help="id da collection")
         if action in {"create", "update"}:
-            item.add_argument("--name")
-            item.add_argument("--description")
+            item.add_argument("--name", metavar="NOME", help="nome legível")
+            item.add_argument("--description", metavar="TEXTO", help="descrição livre")
         if action == "delete":
-            item.add_argument("--delete-documents", action="store_true")
+            item.add_argument("--delete-documents", action="store_true",
+                              help="também apaga documentos que ficariam sem collection")
         if action in {"add-docs", "remove-docs"}:
-            item.add_argument("doc_ids", nargs="+")
+            item.add_argument("doc_ids", nargs="+", help="ids de documentos")
     p = sub.add_parser("documents", help="lista e gerencia documentos")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("list").add_argument("--collection")
-    actions.add_parser("show").add_argument("doc_id")
-    item = actions.add_parser("delete")
-    item.add_argument("doc_id")
-    item.add_argument("--purge-artifacts", action="store_true")
+    item = actions.add_parser("list", help="lista metadados de documentos")
+    item.add_argument("--collection", metavar="ID", help="filtra por collection")
+    _add_paging(item)
+    actions.add_parser("show", help="mostra um documento").add_argument(
+        "doc_id", help="id do documento")
+    item = actions.add_parser("delete", help="exclui documento, chunks e vetores")
+    item.add_argument("doc_id", help="id do documento")
+    item.add_argument("--purge-artifacts", action="store_true",
+                      help="também apaga os artefatos de parse em disco")
     p = sub.add_parser("jobs", help="progresso e cancelamento")
     actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
-    actions.add_parser("show").add_argument("job_id")
-    actions.add_parser("cancel").add_argument("job_id")
-    actions.add_parser("list").add_argument("--limit", type=int, default=10)
+    actions.add_parser("show", help="mostra um job").add_argument("job_id", help="id do job")
+    actions.add_parser("cancel", help="cancela o job ativo").add_argument(
+        "job_id", help="id do job")
+    _add_paging(actions.add_parser("list", help="lista jobs, inclusive concluídos"),
+                limit_default=10)
     return parser
 
 
-def _human(data: Any) -> str:
+def _human(data: Any, page: dict[str, Any] | None = None) -> str:
     if isinstance(data, dict) and "results" in data:
         return "\n\n".join(
             f"{item['filename']} | p. {item['pages']}\n{item['heading_path']}\n{item['text']}"
             for item in data["results"]
         ) or "Nenhum resultado"
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    if page and page["has_more"]:
+        text += f"\n\nHá mais itens: repita com --offset {page['offset'] + page['limit']}."
+    return text
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -245,7 +362,20 @@ def main(argv: list[str] | None = None) -> int:
             "code": "OPERATION_FAILED", "message": str(exc),
         }}))
         return 1
-    print(_human(data) if human else json.dumps({"ok": True, "data": data}, default=str))
+
+    page = None
+    if isinstance(data, Paged):
+        data, page = data.data, data.page
+
+    if human:
+        print(_human(data, page))
+        return 0
+
+    envelope: dict[str, Any] = {"ok": True, "data": data}
+    if page is not None:
+        envelope["page"] = page
+
+    print(json.dumps(envelope, default=str))
     return 0
 
 

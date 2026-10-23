@@ -10,7 +10,7 @@ import logging
 import sqlite3
 from typing import Any, Sequence
 
-from kb.config import FINAL_TOP_K
+from kb.config import FETCH_MAX_CHARS, FINAL_TOP_K
 from kb.db import get_conn
 from kb.retrieval.expand import Passage, expand_to_sections, to_chunk_passages
 from kb.retrieval.search import Hit, search_chunks
@@ -83,6 +83,7 @@ def fetch_pages(
     doc_id: str,
     page_start: int,
     page_end: int | None = None,
+    max_chars: int = FETCH_MAX_CHARS,
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """
@@ -90,6 +91,12 @@ def fetch_pages(
 
     Serve para o agente conferir uma citação ou ler adiante depois de uma busca,
     sem precisar de nova query semântica.
+
+    Um intervalo grande volta em partes: `truncated` avisa do corte e
+    `next_page_start` é a página a pedir na chamada seguinte. O corte só
+    acontece ao virar de página, de modo que o teto é alvo e não limite rígido:
+    cortar no meio de uma página devolveria uma próxima página igual à atual, e
+    quem estivesse lendo em sequência nunca sairia do lugar.
     """
     conn = conn or get_conn()
     page_end = page_end or page_start
@@ -111,15 +118,30 @@ def fetch_pages(
         (doc_id,),
     ).fetchone()
 
+    kept: list[sqlite3.Row] = []
+    chars = 0
+    next_page_start: int | None = None
+    boundary = page_start
+
+    for row in rows:
+        if kept and chars >= max_chars and row["page_start"] > boundary:
+            next_page_start = row["page_start"]
+            break
+        kept.append(row)
+        chars += len(row["text"])
+        boundary = max(boundary, row["page_start"])
+
     return {
         "doc_id": doc_id,
         "filename": document["filename"] if document else None,
         "pages": f"{page_start}-{page_end}" if page_end != page_start else str(page_start),
-        "n_chunks": len(rows),
-        "text": "\n\n".join(row["text"] for row in rows),
+        "n_chunks": len(kept),
+        "text": "\n\n".join(row["text"] for row in kept),
         "headings": list(
-            dict.fromkeys(row["heading_path"] for row in rows if row["heading_path"])
+            dict.fromkeys(row["heading_path"] for row in kept if row["heading_path"])
         ),
+        "truncated": next_page_start is not None,
+        "next_page_start": next_page_start,
     }
 
 

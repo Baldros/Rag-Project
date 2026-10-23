@@ -85,17 +85,22 @@ def fts_query(question: str) -> str:
     Cada termo vai entre aspas porque a sintaxe do FTS5 trata `-`, `*`, `:`,
     `(`, `)` e `AND`/`OR`/`NOT` como operadores: passar a pergunta crua dispara
     erro de sintaxe ou, pior, uma busca silenciosamente errada.
+
+    Termo de um ou dois caracteres entra quando a pergunta o escreveu com
+    maiúscula ou dígito: pH, UV, CA, 5G são o termo técnico exato que o canal
+    vetorial perde, e é por isso que o BM25 está aqui. A pergunta é tokenizada
+    antes de dobrar os acentos, porque `ascii_fold` apaga a caixa junto.
     """
-    terms = [
-        term
-        for term in re.findall(r"\w+", ascii_fold(question).lower())
-        if len(term) > 2
-    ]
+    terms: list[str] = []
 
-    if not terms:
-        return ""
+    for raw in re.findall(r"\w+", question):
+        term = ascii_fold(raw).lower()
+        if not term:
+            continue  # ascii_fold descarta alfabeto sem equivalente (Ω, µ).
+        if len(term) > 2 or any(char.isupper() or char.isdigit() for char in raw):
+            terms.append(term)
 
-    return " OR ".join(f'"{term}"' for term in terms)
+    return " OR ".join(f'"{term}"' for term in dict.fromkeys(terms))
 
 
 def vector_search(

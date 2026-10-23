@@ -16,6 +16,9 @@ from typing import Iterator
 
 from kb.config import DB_PATH, STORE_DIR
 
+# Guardado em PRAGMA user_version. Uma linha por versão, para que a migração
+# diga o que mudou:
+# 1: esquema inicial — collections, documents, sections, chunks, jobs e chunks_fts.
 SCHEMA_VERSION = 1
 
 
@@ -162,13 +165,86 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    """Executa o esquema sem o COMMIT implícito de `executescript`."""
+    statement = ""
+    for line in SCHEMA.splitlines(keepends=True):
+        statement += line
+        # complete_statement mantém cada trigger inteiro, incluindo seus `;`.
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("Instrução incompleta no esquema SQLite")
+
+
+def _upgrade(conn: sqlite3.Connection, version: int) -> None:
+    """
+    Passos de migração de um banco existente, da menor versão para a maior.
+
+    Ainda não há nenhum: a versão 1 é o esquema que `SCHEMA` cria. O primeiro
+    passo entra aqui como `if version < 2: ...`, e `SCHEMA` muda junto, para
+    que um banco novo já nasça no formato e não passe por este caminho.
+    """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    Sobe o banco até SCHEMA_VERSION.
+
+    Versão 0 é banco novo ou sem marca: cria o esquema atual. De 1 em diante
+    existe forma antiga a converter, e é aí que `_upgrade` entra.
+
+    `BEGIN IMMEDIATE` porque a sessão (`kb.runtime`) e a CLI abrem o mesmo
+    arquivo em processos diferentes: quem perder a corrida relê a versão já
+    migrada e não repete o trabalho. Nenhum passo pode usar `executescript`,
+    que dá COMMIT na transação aberta antes de executar.
+    """
+    with transaction(conn, immediate=True):
+        version = _schema_version(conn)
+
+        if version > SCHEMA_VERSION:
+            from kb.session import SessionError
+
+            raise SessionError(
+                "SCHEMA_TOO_NEW",
+                f"Banco na versão {version}; este código entende até {SCHEMA_VERSION}",
+                "Atualize o código do RAG ou aponte KB_STORE_DIR para outro store",
+            )
+
+        if version == SCHEMA_VERSION:
+            return  # Outro processo migrou enquanto esperávamos o lock.
+
+        if version == 0:
+            _create_schema(conn)
+        else:
+            _upgrade(conn, version)
+
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
 def init_db(path: Path | str | None = None) -> sqlite3.Connection:
-    """Cria o schema se necessário e devolve a conexão. Idempotente."""
+    """
+    Cria o schema se necessário, migra o existente e devolve a conexão.
+
+    Idempotente. A versão é lida antes de ser gravada e só sobe: um banco mais
+    novo que este código é recusado em vez de rebaixado, porque `CREATE TABLE
+    IF NOT EXISTS` não altera tabela que já existe e a marca rebaixada faria o
+    código novo enxergar como antigo um banco que já tem as mudanças.
+    """
     STORE_DIR.mkdir(parents=True, exist_ok=True)
 
     conn = connect(path)
-    conn.executescript(SCHEMA)
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    try:
+        _migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
 
     return conn
 
@@ -193,17 +269,23 @@ def get_conn() -> sqlite3.Connection:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(
+    conn: sqlite3.Connection,
+    immediate: bool = False,
+) -> Iterator[sqlite3.Connection]:
     """
     Transação explícita.
 
     A conexão roda em autocommit (isolation_level=None), então lotes grandes
     precisam de BEGIN/COMMIT manual para não pagar um fsync por linha.
+
+    `immediate=True` pega o lock de escrita na abertura, em vez de na primeira
+    escrita: é o que serializa dois processos que leem para decidir se escrevem.
     """
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
-    except Exception:
+    except BaseException:
         conn.execute("ROLLBACK")
         raise
     else:
