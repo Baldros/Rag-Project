@@ -58,6 +58,51 @@ imediatamente. Cancelar encerra a sessão; a ingestão pode ser retomada depois.
 Para chamadas automatizadas, `off --no-wait` e `switch --no-wait` retornam
 `BUSY` se houver job ativo, sem interrompê-lo nem aguardar sua conclusão.
 
+## Extração e qualidade
+
+O parser usa Docling 2.145.0, com fórmulas sempre habilitadas pelo modelo local
+CodeFormulaV2. `--no-enrich` desliga somente os resumos do LLM. O parâmetro
+`ingest --ocr auto|off|full` controla OCR: automático por padrão, desligado para
+PDFs com texto confiável, ou aplicado a todas as páginas. `KB_OCR` define o
+padrão quando a opção é omitida. Caminhos Unicode são abertos pelo Python e
+entregues ao Docling como `DocumentStream`, sem copiar ou renomear o PDF.
+
+A [documentação oficial de enriquecimento](https://docling-project.github.io/docling/usage/enrichments/)
+descreve o custo adicional de fórmulas e a configuração da margem dos recortes.
+Usamos margem de 8%, para reduzir a inclusão de texto vizinho, e interrupção de
+repetições. O [CodeFormulaV2](https://huggingface.co/docling-project/CodeFormulaV2)
+trabalha com imagens a 120 DPI. Falhas detectáveis recebem uma nova tentativa
+usando os recortes e o layout salvo, sem reconverter o PDF inteiro.
+
+`quality.status` informa `complete`, `partial` ou `unknown`. `complete` confirma
+a cobertura da extração e a ausência de falhas detectadas; **não certifica a
+correção matemática** da transcrição. Fórmulas geradas têm
+`formula_verification: automated_unverified`. Avisos, páginas e referências dos
+problemas aparecem no catálogo, `outline`, `search` e `fetch`. Os documentos
+antigos continuam consultáveis e têm qualidade `unknown` até nova ingestão.
+
+Artefatos são salvos em gerações imutáveis com hashes e cobertura exata de
+páginas. Todos os blocos precisam converter com sucesso; uma falha mantém a
+versão anterior publicada e deixa um checkpoint para retomada. A geração usada
+pelo documento é registrada no SQLite junto com os novos chunks. Limpeza de
+vetores antigos fica marcada no banco até terminar, antes dos novos embeddings.
+
+Conversão, fórmulas e segmentação têm assinaturas separadas. Alterar o tamanho
+de chunk reutiliza o parse; mudar a configuração de fórmulas reutiliza o layout
+compatível. O chunker recebe o documento concatenado para preservar os títulos
+entre blocos de 15 páginas. A busca lexical usa uma cópia normalizada dos acentos
+separados pelo TeX; o texto original e as fórmulas das citações são preservados.
+
+Jobs terminam como `done`, `partial`, `failed` ou `cancelled`. `partial` significa
+que há dados disponíveis com falhas detectadas na extração, ou resumos solicitados
+que ficaram pendentes. `jobs show JOB_ID` devolve o resultado estruturado completo,
+incluindo erros e tempos por pass. Na espera síncrona, `partial` retorna
+`JOB_PARTIAL` com instrução para consultar o job.
+
+O esquema SQLite 2 migra o FTS numa transação, mantendo fontes, resumos,
+collections e marcações de embedding. Antes de atualizar uma base existente,
+desligue a sessão e faça backup de SQLite, Chroma e artefatos.
+
 ## CLI
 
 Saída padrão: JSON com `ok` e `data` ou `error` (`code`, `message`, `hint`).
@@ -91,8 +136,9 @@ python -m kb.cli jobs list --limit 10 --offset 0
 ```
 
 `status` consulta o driver da GPU sem carregar modelos. `doctor` faz a checagem
-mais profunda entre SQLite e índice vetorial. A base e os artefatos existentes
-permanecem no mesmo formato.
+mais profunda: compara os IDs dos vetores com os chunks, verifica limpezas
+pendentes e valida hashes e cobertura dos artefatos. Artefatos antigos aparecem
+como `legacy`, sem serem apagados ou reprocessados automaticamente.
 As listagens aceitam `--limit` e `--offset` para paginação, e `page.has_more`
 diz se a página esgotou a lista. Sem essas opções, collections e documentos
 continuam retornando a lista completa; jobs continuam limitados aos 10 mais
