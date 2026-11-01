@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
 import uuid
@@ -73,6 +74,8 @@ def update_job(job_id: str, conn=None, **fields: Any) -> None:
         return
 
     conn = conn or get_conn()
+    if "result" in fields:
+        fields["result_json"] = json.dumps(fields.pop("result"), ensure_ascii=False)
     assignments = ", ".join(f"{key} = ?" for key in fields)
 
     with transaction(conn):
@@ -89,7 +92,7 @@ def get_job(job_id: str, conn=None) -> dict[str, Any] | None:
     if not row:
         return None
 
-    job = dict(row)
+    job = _decode_job(row)
     job["running"] = job["status"] == "running" and _pid_alive(job.get("pid"))
 
     # Um job "running" cujo processo sumiu morreu sem conseguir se marcar.
@@ -102,6 +105,7 @@ def get_job(job_id: str, conn=None) -> dict[str, Any] | None:
             conn=conn,
         )
         job["status"] = "failed"
+        job["error"] = "processo terminou sem reportar conclusão"
 
     return job
 
@@ -147,7 +151,28 @@ def list_jobs(limit: int = 10, conn=None, offset: int = 0) -> list[dict[str, Any
         (limit, offset),
     ).fetchall()
 
-    return [dict(row) for row in rows]
+    return [_decode_job(row, compact=True) for row in rows]
+
+
+def _decode_job(row, compact: bool = False) -> dict:
+    job = dict(row)
+    raw = job.pop("result_json", None)
+    result = json.loads(raw) if raw else None
+    if compact and result:
+        result = {key: len(result.get(key, [])) for key in ("indexed", "skipped", "failed")}
+    job["result"] = result
+    return job
+
+
+def result_status(result: dict) -> str:
+    available = [*result.get("indexed", []), *result.get("skipped", [])]
+    if not available:
+        return "failed"
+    enrichment = result.get("enrichment", {})
+    if (result.get("failed") or enrichment.get("failed") or enrichment.get("skipped") or
+            any(item.get("quality", {}).get("status") == "partial" for item in available)):
+        return "partial"
+    return "done"
 
 
 def _pid_alive(pid: int | None) -> bool:

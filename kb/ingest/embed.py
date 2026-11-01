@@ -79,17 +79,18 @@ def embed_pending(
     conn = conn or get_conn()
     index = get_index()
 
+    cleanup_pending_vectors(conn, index, doc_ids)
     total = count_pending(doc_ids, conn)
     if total == 0:
         logger.info("Nenhum chunk pendente de embedding.")
+        _mark_documents_indexed(conn, doc_ids)
         return 0
 
     logger.info("Embedding de %s chunks com %s", total, EMBED_MODEL)
-    EMBEDDER.load()
-
     done = 0
 
     try:
+        EMBEDDER.load()
         while True:
             rows = _fetch_batch(conn, doc_ids, EMBED_BATCH_SIZE)
             if not rows:
@@ -119,11 +120,12 @@ def embed_pending(
             if on_progress:
                 on_progress(done, total, f"{done}/{total} chunks embedados")
 
-        _mark_documents_indexed(conn, doc_ids)
-
     finally:
-        if unload_when_done:
-            unload_all()
+        try:
+            _mark_documents_indexed(conn, doc_ids)
+        finally:
+            if unload_when_done:
+                unload_all()
 
     logger.info("Embedding concluído: %s chunks", done)
     return done
@@ -150,6 +152,8 @@ def _mark_documents_indexed(
                    embed_model = ?,
                    indexed_at = datetime('now')
              WHERE status != 'indexed'{clause}
+               AND vector_reset_pending = 0
+               AND EXISTS (SELECT 1 FROM chunks WHERE chunks.doc_id = documents.doc_id)
                AND NOT EXISTS (
                    SELECT 1 FROM chunks
                     WHERE chunks.doc_id = documents.doc_id
@@ -158,6 +162,21 @@ def _mark_documents_indexed(
             """,
             [EMBED_ID, *params],
         )
+
+
+def cleanup_pending_vectors(conn, index, doc_ids: list[str] | None = None) -> None:
+    """Delete obsolete vectors before embedding; the durable flag survives a crash."""
+    clause = ""
+    if doc_ids:
+        clause = f" AND doc_id IN ({','.join('?' for _ in doc_ids)})"
+    rows = conn.execute("SELECT doc_id FROM documents WHERE vector_reset_pending = 1" + clause,
+                        doc_ids or []).fetchall()
+    for row in rows:
+        doc_id = row["doc_id"]
+        index.delete_docs([doc_id])
+        with transaction(conn):
+            conn.execute("UPDATE chunks SET embedded = 0 WHERE doc_id = ?", (doc_id,))
+            conn.execute("UPDATE documents SET vector_reset_pending = 0 WHERE doc_id = ?", (doc_id,))
 
 
 def reset_embeddings(
@@ -184,15 +203,17 @@ def reset_embeddings(
                 doc_ids,
             )
             conn.execute(
-                f"UPDATE documents SET status = 'parsed' WHERE doc_id IN ({placeholders})",
+                f"UPDATE documents SET status = 'parsed', vector_reset_pending = 1 WHERE doc_id IN ({placeholders})",
                 doc_ids,
             )
-        index.delete_docs(doc_ids)
+        cleanup_pending_vectors(conn, index, doc_ids)
         return cursor.rowcount
 
     with transaction(conn):
         cursor = conn.execute("UPDATE chunks SET embedded = 0")
-        conn.execute("UPDATE documents SET status = 'parsed'")
+        conn.execute("UPDATE documents SET status = 'parsed', vector_reset_pending = 1")
 
     index.reset()
+    with transaction(conn):
+        conn.execute("UPDATE documents SET vector_reset_pending = 0")
     return cursor.rowcount

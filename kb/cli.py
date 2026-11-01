@@ -82,9 +82,10 @@ def _wait_job(job_id: str) -> dict[str, Any]:
         job = get_job(job_id)
         if job is None:
             return _missing("job", job_id)
-        if job["status"] in {"done", "failed", "cancelled"}:
+        if job["status"] in {"done", "partial", "failed", "cancelled"}:
             if job["status"] != "done":
-                raise SessionError("JOB_FAILED", job.get("error") or job["status"])
+                raise SessionError("JOB_PARTIAL" if job["status"] == "partial" else "JOB_FAILED",
+                                   job.get("error") or job["status"], f"Consulte kb jobs show {job_id}")
             return job
         progress = (job.get("pass_name"), job.get("progress"), job.get("total"))
         if sys.stderr.isatty() and progress != previous:
@@ -117,7 +118,7 @@ def _run(args: argparse.Namespace) -> Any:
         payload = (
             {"paths": args.paths, "collection": args.collection,
              "collection_name": args.collection_name, "force": args.force,
-             "enrich": not args.no_enrich}
+             "enrich": not args.no_enrich, "ocr": args.ocr}
             if cmd == "ingest" else
             {"collection": args.collection, "reset": args.reset}
         )
@@ -146,9 +147,10 @@ def _run(args: argparse.Namespace) -> Any:
             return _missing("collection", args.collection)
         return result
     if cmd == "doctor":
-        from kb.health import consistency, orphan_artifacts
+        from kb.health import consistency, orphan_artifacts, artifact_health
 
-        return {"consistency": consistency(), "orphan_artifacts": orphan_artifacts()}
+        return {"consistency": consistency(), "orphan_artifacts": orphan_artifacts(),
+                "artifacts": artifact_health()}
     if cmd == "models":
         from kb import config
 
@@ -200,10 +202,11 @@ def _run(args: argparse.Namespace) -> Any:
             )
         if args.action == "show":
             from kb.db import get_conn
+            from kb.quality import document_metadata
 
             row = get_conn().execute("SELECT * FROM documents WHERE doc_id = ?",
                                      (args.doc_id,)).fetchone()
-            return dict(row) if row else _missing("documento", args.doc_id)
+            return document_metadata(row) if row else _missing("documento", args.doc_id)
         if args.action == "delete":
             result = api.delete_document(args.doc_id, purge_artifacts=args.purge_artifacts)
             return result if result["ok"] else _missing("documento", args.doc_id)
@@ -267,6 +270,8 @@ def build_parser() -> JsonParser:
                    help="nome legível da collection, quando ela for criada")
     p.add_argument("--force", action="store_true", help="reprocessa documento já indexado")
     p.add_argument("--no-enrich", action="store_true", help="não gera resumos com o LLM")
+    p.add_argument("--ocr", choices=["auto", "off", "full"], default=None,
+                   help="OCR automático, desligado ou em todas as páginas; fórmulas sempre ativas")
     p.add_argument("--background", action="store_true",
                    help="devolve job_id em vez de aguardar o fim")
     p = sub.add_parser("reindex", help="reconstrói vetores em modo ingestion")

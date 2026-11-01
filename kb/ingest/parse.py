@@ -1,72 +1,76 @@
-"""
-Pass 1 — parse.
-
-Converte o PDF em um artefato canônico e imutável no disco. É o passo mais caro
-do sistema inteiro, então roda uma vez só: qualquer mudança futura de chunking,
-de modelo de embedding ou de schema relê o artefato em vez de reprocessar o PDF.
-
-Dois detalhes que vieram da auditoria do pipeline antigo:
-
-1. O `DocumentConverter` é criado **uma vez** e reusado entre blocos. A versão
-   anterior instanciava um por bloco de 15 páginas, o que reinicializava o
-   pipeline de modelos ONNX 67 vezes num livro de 1000 páginas.
-2. Cada bloco é gravado assim que converte. Matar o processo no meio e rodar de
-   novo retoma de onde parou, em vez de recomeçar o livro.
-"""
-
+"""Resumable Docling conversion with immutable, validated generations."""
 from __future__ import annotations
 
 import json
 import logging
+import re
+import sys
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from kb.config import ARTIFACTS_DIR, PAGE_BLOCK_SIZE, parse_version
+from kb import config
+from kb.config import ARTIFACTS_DIR, PAGE_BLOCK_SIZE, formula_version, parse_version
 from kb.utils import file_sha256, force_gc, get_pdf_page_count
 
 logger = logging.getLogger(__name__)
-
 ProgressFn = Callable[[int, int, str], None]
-
 _converter: Any = None
+_converter_ocr: str | None = None
+_formula_model: Any = None
 
 
-def get_converter():
-    """
-    Singleton do DocumentConverter.
+class ParseError(RuntimeError):
+    def __init__(self, message: str, manifest: dict):
+        super().__init__(message)
+        self.manifest = manifest
 
-    Construir um custa o carregamento dos modelos de layout e de tabela; reusar
-    entre blocos e entre arquivos é o que torna a ingestão de uma pasta viável.
-    """
-    global _converter
 
+def get_converter(ocr: str | None = None):
+    global _converter, _converter_ocr
+    ocr = ocr or config.OCR_MODE
+    if ocr not in {"auto", "off", "full"}:
+        raise ValueError("OCR deve ser auto, off ou full")
+    if _converter is not None and _converter_ocr != ocr:
+        release_converter()
     if _converter is None:
-        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            AcceleratorOptions, CodeFormulaVlmOptions, OcrMode, PdfPipelineOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
 
-        logger.info("Inicializando DocumentConverter (carrega modelos de layout)...")
-        _converter = DocumentConverter()
-
+        options = PdfPipelineOptions(
+            do_ocr=ocr != "off", do_table_structure=True,
+            do_formula_enrichment=True, do_code_enrichment=False,
+            accelerator_options=AcceleratorOptions(device=config.DEVICE),
+            code_formula_options=CodeFormulaVlmOptions.from_preset(
+                config.FORMULA_PRESET, expansion_factor=config.FORMULA_MARGIN,
+                stop_on_repetition=True,
+            ),
+        )
+        if ocr == "full":
+            options.ocr_options.mode = OcrMode.FULL_PAGE
+        _converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF],
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)},
+        )
+        _converter_ocr = ocr
     return _converter
 
 
 def release_converter() -> None:
-    """Libera o converter e seus modelos ao fim do pass."""
-    global _converter
-
-    if _converter is not None:
-        del _converter
-        _converter = None
-
+    global _converter, _converter_ocr, _formula_model
+    _converter = _converter_ocr = None
+    _formula_model = None
     force_gc()
-
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover
-        pass
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def artifact_dir(doc_id: str) -> Path:
@@ -77,208 +81,320 @@ def manifest_path(doc_id: str) -> Path:
     return artifact_dir(doc_id) / "manifest.json"
 
 
-def read_manifest(doc_id: str) -> dict[str, Any] | None:
-    path = manifest_path(doc_id)
+def _path(doc_id: str, relative: str) -> Path:
+    root = artifact_dir(doc_id).resolve()
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Caminho de artefato fora do documento")
+    return path
 
-    if not path.exists():
-        return None
 
+def _read_json(path: Path) -> dict | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        logger.warning("Manifest ilegível para %s; será reprocessado.", doc_id)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
         return None
 
 
-def _write_manifest(doc_id: str, manifest: dict[str, Any]) -> None:
-    path = manifest_path(doc_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def read_manifest(doc_id: str, relative: str | None = None) -> dict | None:
+    return _read_json(_path(doc_id, relative or "manifest.json"))
 
-    # Escrita atômica: um manifest truncado por interrupção invalidaria o
-    # artefato inteiro e forçaria reprocessar o livro.
+
+def _atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
 
-def is_parsed(doc_id: str, version: str | None = None) -> bool:
-    """True se existe artefato completo e com a assinatura de parse esperada."""
-    manifest = read_manifest(doc_id)
+def _write_manifest(doc_id: str, manifest: dict) -> None:
+    _atomic_json(_path(doc_id, manifest["manifest_file"]), manifest)
+    _atomic_json(_path(doc_id, "candidate.json"), manifest)
 
-    if not manifest:
-        return False
 
-    if manifest.get("parse_version") != (version or parse_version()):
-        return False
-
-    return manifest.get("complete") is True
+def activate_manifest(doc_id: str, manifest: dict) -> None:
+    # SQLite stores the authoritative generation. This pointer is for inspection.
+    _atomic_json(manifest_path(doc_id), manifest)
 
 
 def _block_ranges(n_pages: int, block_size: int) -> list[tuple[int, int]]:
-    return [
-        (start, min(start + block_size - 1, n_pages))
-        for start in range(1, n_pages + 1, block_size)
-    ]
+    if block_size < 1:
+        raise ValueError("Tamanho de bloco deve ser positivo")
+    return [(p, min(p + block_size - 1, n_pages)) for p in range(1, n_pages + 1, block_size)]
 
 
-def parse_document(
-    pdf_path: Path | str,
-    doc_id: str | None = None,
-    on_progress: ProgressFn | None = None,
-    force: bool = False,
-) -> dict[str, Any]:
-    """
-    Converte um PDF em artefato. Devolve o manifest.
+def _block_valid(doc_id: str, block: dict) -> bool:
+    try:
+        path = _path(doc_id, block["file"])
+        if not block.get("ok") or file_sha256(path) != block.get("sha256"):
+            return False
+        data = _read_json(path)
+        return bool(data and data.get("schema_name") == "DoclingDocument" and
+                    set(map(int, data.get("pages", {}))) ==
+                    set(range(block["page_start"], block["page_end"] + 1)))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
-    Idempotente: se o artefato já existe com a mesma `parse_version`, retorna
-    imediatamente sem tocar no Docling.
-    """
+
+def validate_manifest(doc_id: str, manifest: dict | None) -> bool:
+    try:
+        if not manifest or not manifest.get("complete") or manifest["n_pages"] < 1:
+            return False
+        blocks = manifest["blocks"]
+        return ([(b["page_start"], b["page_end"]) for b in blocks] ==
+                _block_ranges(manifest["n_pages"], manifest["block_size"]) and
+                all(_block_valid(doc_id, b) for b in blocks))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def is_parsed(doc_id: str, version: str | None = None, manifest: dict | None = None) -> bool:
+    manifest = manifest if manifest is not None else read_manifest(doc_id)
+    return bool(manifest and manifest.get("parse_version") == (version or parse_version())
+                and manifest.get("formula_version") == formula_version()
+                and validate_manifest(doc_id, manifest))
+
+
+def _formulas(document):
+    return [item for item, _ in document.iterate_items() if item.label.value == "formula"]
+
+
+def _missing(item) -> bool:
+    return not item.text.strip() or "formula-not-decoded" in item.text
+
+
+def _formula_problem(item) -> str | None:
+    if _missing(item):
+        return "Fórmula sem LaTeX após uma nova tentativa."
+    depth = 0
+    for brace in re.findall(r"(?<!\\)[{}]", item.text):
+        depth += 1 if brace == "{" else -1
+        if depth < 0:
+            break
+    if depth != 0:
+        return "LaTeX com chaves desequilibradas; confira a fórmula no PDF."
+    return None
+
+
+@contextmanager
+def _formula_errors():
+    errors: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.ERROR:
+                errors.append(record.getMessage())
+
+    log = logging.getLogger("docling.models.stages.code_formula.code_formula_vlm_model")
+    handler = Capture()
+    log.addHandler(handler)
+    try:
+        yield errors
+    finally:
+        log.removeHandler(handler)
+
+
+def _enrich_existing(document, source: bytes, converter, refs: set[str] | None = None) -> list[str]:
+    """Use Docling's own formula model on cached layout and PDF crops only."""
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+    from docling.datamodel.base_models import InputFormat, ItemAndImageEnrichmentElement
+    from docling.datamodel.document import InputDocument
+    from docling.models.stages.code_formula.code_formula_vlm_model import CodeFormulaVlmModel
+
+    global _formula_model
+    model = next((m for p in converter.initialized_pipelines.values()
+                  for m in p.enrichment_pipe if isinstance(m, CodeFormulaVlmModel)), None)
+    if model is None:
+        # A formula-only retry must not load the layout/table/OCR models.
+        if _formula_model is None:
+            from docling.datamodel.pipeline_options import AcceleratorOptions, CodeFormulaVlmOptions
+            _formula_model = CodeFormulaVlmModel(
+                enabled=True, enable_remote_services=False, artifacts_path=None,
+                accelerator_options=AcceleratorOptions(device=config.DEVICE),
+                options=CodeFormulaVlmOptions.from_preset(
+                    config.FORMULA_PRESET, expansion_factor=config.FORMULA_MARGIN,
+                    stop_on_repetition=True, extract_code=False, extract_formulas=True,
+                ),
+            )
+        model = _formula_model
+    inp = InputDocument(path_or_stream=BytesIO(source), format=InputFormat.PDF,
+                        backend=PyPdfiumDocumentBackend, filename="source.pdf")
+    try:
+        with _formula_errors() as errors:
+            batch = []
+            for item in _formulas(document):
+                if refs is not None and item.self_ref not in refs:
+                    continue
+                prov = item.prov[0]
+                page = inp._backend.load_page(prov.page_no - 1)
+                try:
+                    bbox = prov.bbox.expand_by_scale(model.expansion_factor, model.expansion_factor)
+                    crop = page.get_page_image(scale=model.images_scale, cropbox=bbox)
+                finally:
+                    page.unload()
+                batch.append(ItemAndImageEnrichmentElement(item=item, image=crop))
+                if len(batch) >= model.elements_batch_size:
+                    list(model(doc=document, element_batch=batch))
+                    batch = []
+            if batch:
+                list(model(doc=document, element_batch=batch))
+        return errors
+    finally:
+        inp.release()
+
+
+def _quality(document, errors: list[str]) -> dict:
+    formulas = _formulas(document)
+    issues = [{"code": "FORMULA_EXTRACTION", "ref": item.self_ref,
+               "pages": sorted({p.page_no for p in item.prov}),
+               "message": _formula_problem(item)}
+              for item in formulas if _formula_problem(item)]
+    return {"status": "partial" if issues or errors else "complete",
+            "formula_count": len(formulas), "formula_missing": sum(_missing(i) for i in formulas),
+            "formula_flagged": len(issues), "formula_verification": "automated_unverified" if formulas else "not_applicable",
+            "issues": issues, "errors": errors,
+            "warnings": (["Há fórmulas ausentes ou cuja extração falhou."] if issues or errors else []) +
+                        (["Fórmulas transcritas por modelo local; a correção matemática não foi verificada."] if formulas else [])}
+
+
+def parse_document(pdf_path: Path | str, doc_id: str | None = None,
+                   on_progress: ProgressFn | None = None, force: bool = False,
+                   ocr: str | None = None, previous: dict | None = None) -> dict:
+    global _formula_model
     pdf_path = Path(pdf_path).resolve()
     doc_id = doc_id or file_sha256(pdf_path)
-    version = parse_version()
+    ocr = ocr or config.OCR_MODE
+    version, formulas_version = parse_version(ocr), formula_version()
+    previous = previous if previous is not None else read_manifest(doc_id)
+    if (not force and is_parsed(doc_id, version, previous) and
+            previous.get("quality", {}).get("status") == "complete"):
+        return previous
 
-    if not force and is_parsed(doc_id, version):
-        logger.info("skip parse (já indexado): %s", pdf_path.name)
-        manifest = read_manifest(doc_id)
-        assert manifest is not None
-        manifest["skipped"] = True
-        return manifest
-
+    candidate = read_manifest(doc_id, "candidate.json")
+    reusable = candidate if candidate and candidate.get("parse_version") == version else previous
+    old_blocks = ({(b["page_start"], b["page_end"]): b for b in reusable.get("blocks", [])}
+                  if not force and reusable and reusable.get("parse_version") == version else {})
     n_pages = get_pdf_page_count(pdf_path)
     ranges = _block_ranges(n_pages, PAGE_BLOCK_SIZE)
+    generation = f"generations/{uuid.uuid4().hex}"
+    manifest = {"doc_id": doc_id, "filename": pdf_path.name, "source_path": str(pdf_path),
+                "parse_version": version, "formula_version": formulas_version, "ocr": ocr,
+                "manifest_file": f"{generation}/manifest.json", "n_pages": n_pages,
+                "block_size": PAGE_BLOCK_SIZE, "blocks": [], "complete": False,
+                "started_at": datetime.now(timezone.utc).isoformat()}
+    source = pdf_path.read_bytes()  # Unicode paths never reach a native PDF backend.
+    started = time.monotonic()
+    from docling.datamodel.base_models import DocumentStream, ConversionStatus
+    from docling_core.types.doc import DoclingDocument
 
-    blocks_dir = artifact_dir(doc_id) / "blocks"
-    blocks_dir.mkdir(parents=True, exist_ok=True)
-
-    previous = read_manifest(doc_id) or {}
-    reusable = (
-        previous.get("parse_version") == version and not force
-    )
-    done_blocks: dict[str, dict[str, Any]] = (
-        {block["file"]: block for block in previous.get("blocks", [])}
-        if reusable
-        else {}
-    )
-
-    manifest: dict[str, Any] = {
-        "doc_id": doc_id,
-        "filename": pdf_path.name,
-        "source_path": str(pdf_path),
-        "parse_version": version,
-        "n_pages": n_pages,
-        "block_size": PAGE_BLOCK_SIZE,
-        "blocks": [],
-        "complete": False,
-        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-
-    converter = get_converter()
-    total = len(ranges)
-
-    for index, (page_start, page_end) in enumerate(ranges, start=1):
-        name = f"{page_start:05d}-{page_end:05d}.json"
-        target = blocks_dir / name
-
-        if name in done_blocks and target.exists():
-            manifest["blocks"].append(done_blocks[name])
+    for index, (start, end) in enumerate(ranges, 1):
+        if on_progress:
+            on_progress(index - 1, len(ranges), f"{pdf_path.name} p.{start}-{end} (convertendo)")
+        old = old_blocks.get((start, end), {})
+        valid_old = _block_valid(doc_id, old)
+        if (valid_old and old.get("formula_version") == formulas_version and
+                old.get("quality", {}).get("status") == "complete"):
+            manifest["blocks"].append(old)
+            _write_manifest(doc_id, manifest)
             if on_progress:
-                on_progress(index, total, f"{pdf_path.name} p.{page_start}-{page_end} (cache)")
+                on_progress(index, len(ranges), f"{pdf_path.name} p.{start}-{end} (cache)")
             continue
-
-        entry: dict[str, Any] = {
-            "file": name,
-            "page_start": page_start,
-            "page_end": page_end,
-            "ok": False,
-        }
-
+        entry = {"file": f"{generation}/blocks/{start:05d}-{end:05d}.json",
+                 "page_start": start, "page_end": end, "ok": False,
+                 "formula_version": formulas_version}
+        block_started = time.monotonic()
         try:
-            result = converter.convert(
-                pdf_path,
-                page_range=(page_start, page_end),
-                raises_on_error=False,
-            )
-
-            if result.document is None:
-                entry["error"] = "documento vazio"
-                logger.warning(
-                    "Sem documento em %s p.%s-%s", pdf_path.name, page_start, page_end
-                )
+            converter = get_converter(ocr)
+            if valid_old:
+                document = DoclingDocument.load_from_json(_path(doc_id, old["file"]))
+                refs = (None if old.get("formula_version") != formulas_version or
+                        old.get("quality", {}).get("errors") else
+                        {i["ref"] for i in old.get("quality", {}).get("issues", [])})
+                try:
+                    errors = _enrich_existing(document, source, converter, refs)
+                except Exception as exc:
+                    errors = [str(exc)]
+                entry["layout_reused"] = True
             else:
-                result.document.save_as_json(target)
-                entry["ok"] = True
-
-            del result
-
+                # Drop a standalone retry model before initializing a full pipeline.
+                if _formula_model is not None:
+                    _formula_model = None
+                    force_gc()
+                with _formula_errors() as errors:
+                    result = converter.convert(
+                        DocumentStream(name=pdf_path.name, stream=BytesIO(source)),
+                        page_range=(start, end), raises_on_error=False,
+                    )
+                entry["conversion_status"] = result.status.value
+                if result.status != ConversionStatus.SUCCESS:
+                    entry["conversion_errors"] = [e.model_dump(mode="json") for e in result.errors]
+                    raise RuntimeError(f"Conversão {result.status.value}: {entry['conversion_errors']}")
+                document = result.document
+                missing = {i.self_ref for i in _formulas(document) if _formula_problem(i)}
+                if missing or errors:
+                    try:
+                        errors = _enrich_existing(document, source, converter, None if errors else missing)
+                    except Exception as exc:
+                        errors = [str(exc)]
+                    entry["formula_retried"] = True
+            if set(document.pages) != set(range(start, end + 1)):
+                raise RuntimeError(f"Cobertura de páginas inválida: esperado {start}-{end}, obtido {sorted(document.pages)}")
+            entry["quality"] = _quality(document, errors)
+            target = _path(doc_id, entry["file"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(".json.tmp")
+            document.save_as_json(tmp)
+            tmp.replace(target)
+            entry.update(ok=True, sha256=file_sha256(target))
         except Exception as exc:
             entry["error"] = str(exc)
-            logger.exception(
-                "Falha convertendo %s p.%s-%s", pdf_path.name, page_start, page_end
-            )
-
+            logger.exception("Falha convertendo %s p.%s-%s", pdf_path.name, start, end)
+        entry["elapsed_seconds"] = round(time.monotonic() - block_started, 3)
         manifest["blocks"].append(entry)
-
-        # Grava o manifest a cada bloco: é o que torna o pass retomável.
         _write_manifest(doc_id, manifest)
         force_gc()
-
         if on_progress:
-            on_progress(index, total, f"{pdf_path.name} p.{page_start}-{page_end}")
+            on_progress(index, len(ranges), f"{pdf_path.name} p.{start}-{end}")
 
-    ok_blocks = [block for block in manifest["blocks"] if block.get("ok")]
-    manifest["complete"] = bool(ok_blocks)
-    manifest["n_blocks_ok"] = len(ok_blocks)
-    manifest["n_blocks_failed"] = len(manifest["blocks"]) - len(ok_blocks)
-    manifest["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
+    manifest["n_blocks_ok"] = sum(bool(b.get("ok")) for b in manifest["blocks"])
+    manifest["n_blocks_failed"] = len(ranges) - manifest["n_blocks_ok"]
+    manifest["complete"] = bool(ranges) and manifest["n_blocks_failed"] == 0
+    qualities = [b.get("quality", {}) for b in manifest["blocks"]]
+    manifest["quality"] = {
+        "status": "complete" if manifest["complete"] and all(q.get("status") == "complete" for q in qualities) else "partial",
+        "formula_count": sum(q.get("formula_count", 0) for q in qualities),
+        "formula_missing": sum(q.get("formula_missing", 0) for q in qualities),
+        "formula_flagged": sum(q.get("formula_flagged", 0) for q in qualities),
+        "formula_verification": "automated_unverified" if any(q.get("formula_count", 0) for q in qualities) else "not_applicable",
+        "issues": [{**i, "block": b["file"]} for b in manifest["blocks"] for i in b.get("quality", {}).get("issues", [])],
+        "errors": [e for q in qualities for e in q.get("errors", [])],
+        "warnings": [],
+    }
+    if manifest["quality"]["status"] != "complete":
+        manifest["quality"]["warnings"] = ["Há falhas de conversão ou fórmulas ausentes; consulte os detalhes de qualidade."]
+    if manifest["quality"]["formula_count"]:
+        manifest["quality"]["warnings"].append("Fórmulas transcritas por modelo local; a correção matemática não foi verificada.")
+    manifest["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
     _write_manifest(doc_id, manifest)
-
-    logger.info(
-        "parse concluído: %s | páginas=%s | blocos ok=%s falhos=%s",
-        pdf_path.name,
-        n_pages,
-        manifest["n_blocks_ok"],
-        manifest["n_blocks_failed"],
-    )
-
+    if not manifest["complete"]:
+        raise ParseError(f"Conversão incompleta: {manifest['n_blocks_failed']} de {len(ranges)} blocos falharam", manifest)
     return manifest
 
 
-def iter_blocks(doc_id: str) -> Iterator[tuple[int, int, Any]]:
-    """
-    Percorre os blocos do artefato em ordem de página.
-
-    Devolve (page_start, page_end, DoclingDocument). Blocos que falharam no
-    parse são pulados silenciosamente — já foram registrados no manifest.
-    """
+def iter_blocks(doc_id: str, manifest: dict | None = None) -> Iterator[tuple[int, int, Any]]:
     from docling_core.types.doc import DoclingDocument
-
-    manifest = read_manifest(doc_id)
-    if not manifest:
-        return
-
-    blocks_dir = artifact_dir(doc_id) / "blocks"
-
-    for block in sorted(manifest["blocks"], key=lambda b: b["page_start"]):
-        if not block.get("ok"):
-            continue
-
-        path = blocks_dir / block["file"]
-        if not path.exists():
-            logger.warning("Bloco ausente: %s", path)
-            continue
-
-        yield block["page_start"], block["page_end"], DoclingDocument.load_from_json(path)
+    manifest = manifest if manifest is not None else read_manifest(doc_id)
+    if not validate_manifest(doc_id, manifest):
+        raise RuntimeError("Artefato incompleto, ausente ou corrompido; execute novamente a ingestão")
+    for block in manifest["blocks"]:
+        yield block["page_start"], block["page_end"], DoclingDocument.load_from_json(_path(doc_id, block["file"]))
 
 
-def export_markdown(doc_id: str) -> Path:
-    """Concatena os blocos num markdown legível, para inspeção humana."""
-    parts: list[str] = []
-
-    for _, _, document in iter_blocks(doc_id):
-        parts.append(document.export_to_markdown())
-
-    target = artifact_dir(doc_id) / "document.md"
+def export_markdown(doc_id: str, manifest: dict | None = None) -> Path:
+    manifest = manifest if manifest is not None else read_manifest(doc_id)
+    parts = [doc.export_to_markdown() for _, _, doc in iter_blocks(doc_id, manifest)]
+    target = _path(doc_id, str(Path(manifest["manifest_file"]).parent / "document.md"))
     target.write_text("\n\n".join(parts), encoding="utf-8")
-
     return target

@@ -17,13 +17,16 @@ reprocessa nenhum PDF.
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from kb import collection as collections_api
-from kb.config import parse_version
+from kb.config import parse_version, formula_version, segment_version
+from kb.quality import decode_quality
 from kb.db import get_conn, transaction
 from kb.ingest.embed import embed_pending
 from kb.ingest.parse import (
@@ -31,6 +34,8 @@ from kb.ingest.parse import (
     is_parsed,
     parse_document,
     release_converter,
+    read_manifest,
+    activate_manifest,
 )
 from kb.ingest.segment import (
     ChunkRecord,
@@ -62,22 +67,24 @@ def expand_paths(paths: Sequence[Path | str]) -> list[Path]:
     return sorted(unique.values())
 
 
-def is_indexed(doc_id: str, conn: sqlite3.Connection | None = None) -> bool:
+def is_indexed(doc_id: str, conn: sqlite3.Connection | None = None, ocr: str | None = None) -> bool:
     """Documento já parseado, segmentado e com a assinatura de parse atual."""
     conn = conn or get_conn()
 
     row = conn.execute(
-        "SELECT parse_version, n_chunks FROM documents WHERE doc_id = ?",
+        "SELECT * FROM documents WHERE doc_id = ?",
         (doc_id,),
     ).fetchone()
 
     if not row or not row["n_chunks"]:
         return False
 
-    if row["parse_version"] != parse_version():
+    if (row["parse_version"] != parse_version(ocr) or row["formula_version"] != formula_version()
+            or row["segment_version"] != segment_version()
+            or decode_quality(row["quality_json"]).get("status") != "complete"):
         return False
 
-    return is_parsed(doc_id)
+    return is_parsed(doc_id, parse_version(ocr), read_manifest(doc_id, row["artifact_manifest"]))
 
 
 def register_document(
@@ -93,9 +100,7 @@ def register_document(
             """
             INSERT INTO documents(doc_id, filename, source_path, n_pages, status, created_at)
                  VALUES (?, ?, ?, ?, 'pending', ?)
-            ON CONFLICT(doc_id) DO UPDATE SET
-                 source_path = excluded.source_path,
-                 n_pages     = COALESCE(excluded.n_pages, documents.n_pages)
+            ON CONFLICT(doc_id) DO NOTHING
             """,
             (doc_id, pdf_path.name, str(pdf_path), n_pages, _now()),
         )
@@ -107,6 +112,7 @@ def persist_segments(
     chunks: list[ChunkRecord],
     title: str | None = None,
     conn: sqlite3.Connection | None = None,
+    manifest: dict | None = None,
 ) -> None:
     """
     Grava sections e chunks numa transação só.
@@ -117,6 +123,11 @@ def persist_segments(
     conn = conn or get_conn()
 
     with transaction(conn):
+        old_content = [tuple(row) for row in conn.execute(
+            "SELECT text, heading_path FROM chunks WHERE doc_id = ? ORDER BY ord", (doc_id,))]
+        changed = old_content != [(c.text, c.heading_path) for c in chunks]
+        old_summaries = {(r["text"], r["heading_path"]): (r["summary"], r["enriched_at"])
+                         for r in conn.execute("SELECT * FROM sections WHERE doc_id = ?", (doc_id,))}
         conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
         conn.execute("DELETE FROM sections WHERE doc_id = ?", (doc_id,))
 
@@ -154,11 +165,24 @@ def persist_segments(
             """
             UPDATE documents
                SET n_sections = ?, n_chunks = ?, parse_version = ?,
+                   formula_version = ?, segment_version = ?, vector_reset_pending = 1,
                    title = COALESCE(?, title), status = 'parsed', error = NULL
              WHERE doc_id = ?
             """,
-            (len(sections), len(chunks), parse_version(), title, doc_id),
+            (len(sections), len(chunks), (manifest or {}).get("parse_version", parse_version()),
+             formula_version(), segment_version(), title, doc_id),
         )
+        for section in sections:
+            prior = old_summaries.get((section.text, section.heading_path))
+            if prior:
+                conn.execute("UPDATE sections SET summary = ?, enriched_at = ? WHERE section_id = ?",
+                             (*prior, section.section_id))
+        if changed:
+            conn.execute("UPDATE documents SET summary = NULL, key_topics = NULL, enriched_at = NULL WHERE doc_id = ?", (doc_id,))
+        if manifest:
+            conn.execute("UPDATE documents SET artifact_manifest = ?, quality_json = ?, filename = ?, source_path = ?, n_pages = ? WHERE doc_id = ?",
+                         (manifest["manifest_file"], json.dumps(manifest["quality"], ensure_ascii=False),
+                          manifest["filename"], manifest["source_path"], manifest["n_pages"], doc_id))
 
 
 def ingest_paths(
@@ -168,6 +192,7 @@ def ingest_paths(
     force: bool = False,
     enrich: bool = True,
     conn: sqlite3.Connection | None = None,
+    ocr: str | None = None,
 ) -> dict[str, Any]:
     """
     Executa a ingestão completa e devolve o resumo do que aconteceu.
@@ -194,75 +219,111 @@ def ingest_paths(
         return result
 
     touched: list[str] = []
+    prepared: list[dict] = []
+    started = time.monotonic()
+    result["timings"] = {}
 
     # ---------- Pass 1: Docling ----------
     try:
         for index, pdf_path in enumerate(files, start=1):
-            doc_id = file_sha256(pdf_path)
-
             if on_progress:
                 on_progress("parse", index - 1, len(files), pdf_path.name)
-
-            if not force and is_indexed(doc_id, conn):
-                logger.info("skip (já indexado): %s", pdf_path.name)
-                result["skipped"].append({"doc_id": doc_id, "filename": pdf_path.name})
-                touched.append(doc_id)
-                _associate(collection_id, doc_id, conn)
-                continue
-
+            doc_id = None
             try:
+                doc_id = file_sha256(pdf_path)
+                prior = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+                if not force and is_indexed(doc_id, conn, ocr):
+                    with transaction(conn):
+                        conn.execute("UPDATE documents SET filename = ?, source_path = ? WHERE doc_id = ?",
+                                     (pdf_path.name, str(pdf_path), doc_id))
+                    result["skipped"].append({"doc_id": doc_id, "filename": pdf_path.name,
+                                              "quality": decode_quality(prior["quality_json"])})
+                    touched.append(doc_id)
+                    _associate(collection_id, doc_id, conn)
+                    continue
                 register_document(
                     doc_id, pdf_path, get_pdf_page_count(pdf_path), conn=conn
                 )
 
-                parse_document(
+                manifest = parse_document(
                     pdf_path,
                     doc_id,
                     on_progress=lambda done, total, msg: (
                         on_progress("parse", done, total, msg) if on_progress else None
                     ),
                     force=force,
+                    ocr=ocr,
+                    previous=read_manifest(doc_id, prior["artifact_manifest"]) if prior else None,
                 )
 
-                sections, chunks = segment_document(doc_id)
+                sections, chunks = segment_document(doc_id, manifest)
 
                 if not chunks:
                     raise RuntimeError("parse não produziu nenhum chunk")
 
-                persist_segments(doc_id, sections, chunks, conn=conn)
-                export_markdown(doc_id)
-                _associate(collection_id, doc_id, conn)
+                export_markdown(doc_id, manifest)
+                # The artifact and its chunks become visible in one transaction.
+                with transaction(conn):
+                    persist_segments(doc_id, sections, chunks, conn=conn, manifest=manifest)
+                    _associate(collection_id, doc_id, conn)
+                try:
+                    activate_manifest(doc_id, manifest)
+                except OSError:
+                    logger.exception("Não foi possível atualizar o atalho do manifest; a geração está no SQLite")
 
                 stats = summarize(sections, chunks)
                 result["n_sections"] += stats["n_sections"]
                 result["n_chunks"] += stats["n_chunks"]
-                result["indexed"].append(
-                    {"doc_id": doc_id, "filename": pdf_path.name, **stats}
+                prepared.append(
+                    {"doc_id": doc_id, "filename": pdf_path.name, **stats,
+                     "quality": manifest["quality"], "manifest": manifest["manifest_file"]}
                 )
                 touched.append(doc_id)
 
             except Exception as exc:
                 logger.exception("Falha ingerindo %s", pdf_path.name)
-                _mark_failed(doc_id, str(exc), conn)
+                if doc_id:
+                    _mark_failed(doc_id, str(exc), conn)
                 result["failed"].append(
-                    {"doc_id": doc_id, "filename": pdf_path.name, "error": str(exc)}
+                    {"doc_id": doc_id, "filename": pdf_path.name, "phase": "parse",
+                     "error": str(exc), **({"manifest": exc.manifest} if hasattr(exc, "manifest") else {})}
                 )
     finally:
         # Libera a GPU antes do Pass 2: a regra é um modelo por vez.
         release_converter()
         release_chunker()
+    result["timings"]["parse_segment"] = round(time.monotonic() - started, 3)
 
     # ---------- Pass 2: bge-m3 ----------
     # `embed_pending` descarrega o embedder ao terminar, liberando a GPU para o
     # LLM do Pass 3.
     if touched:
-        result["n_embedded"] = embed_pending(
-            doc_ids=touched,
-            on_progress=lambda done, total, msg: (
-                on_progress("embed", done, total, msg) if on_progress else None
-            ),
-            conn=conn,
-        )
+        embed_started = time.monotonic()
+        embed_error = None
+        try:
+            result["n_embedded"] = embed_pending(
+                doc_ids=touched,
+                on_progress=lambda done, total, msg: (
+                    on_progress("embed", done, total, msg) if on_progress else None
+                ), conn=conn,
+            )
+        except Exception as exc:
+            embed_error = str(exc)
+            logger.exception("Falha no pass de embedding")
+        result["timings"]["embed"] = round(time.monotonic() - embed_started, 3)
+        successful = []
+        skipped_ids = {item["doc_id"] for item in result["skipped"]}
+        for item in [*prepared, *result["skipped"]]:
+            row = conn.execute("SELECT status, vector_reset_pending FROM documents WHERE doc_id = ?", (item["doc_id"],)).fetchone()
+            pending = conn.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ? AND embedded = 0", (item["doc_id"],)).fetchone()[0]
+            if row["status"] == "indexed" and not pending and not row["vector_reset_pending"]:
+                successful.append(item["doc_id"])
+                if item["doc_id"] not in skipped_ids:
+                    result["indexed"].append(item)
+            else:
+                result["failed"].append({**item, "phase": "embed", "error": embed_error or "Embedding incompleto"})
+        result["skipped"] = [i for i in result["skipped"] if i["doc_id"] in successful]
+        touched = successful
 
     # ---------- Pass 3: LLM local ----------
     if touched and enrich:
@@ -270,14 +331,19 @@ def ingest_paths(
 
         if on_progress:
             on_progress("enrich", 0, 1, "iniciando resumos")
-        result["enrichment"] = run_pass(
-            doc_ids=touched,
-            on_progress=lambda done, total, msg: (
-                on_progress("enrich", done, total, msg) if on_progress else None
-            ),
-            conn=conn,
-        )
+        enrich_started = time.monotonic()
+        try:
+            result["enrichment"] = run_pass(
+                doc_ids=touched,
+                on_progress=lambda done, total, msg: (
+                    on_progress("enrich", done, total, msg) if on_progress else None
+                ), conn=conn,
+            )
+        except Exception as exc:
+            result["enrichment"] = {"failed": 1, "error": str(exc)}
+        result["timings"]["enrich"] = round(time.monotonic() - enrich_started, 3)
 
+    result["timings"]["total"] = round(time.monotonic() - started, 3)
     return result
 
 
@@ -293,6 +359,6 @@ def _associate(
 def _mark_failed(doc_id: str, error: str, conn: sqlite3.Connection) -> None:
     with transaction(conn):
         conn.execute(
-            "UPDATE documents SET status = 'failed', error = ? WHERE doc_id = ?",
+            "UPDATE documents SET status = CASE WHEN COALESCE(n_chunks, 0) > 0 THEN status ELSE 'failed' END, error = ? WHERE doc_id = ?",
             (error[:2000], doc_id),
         )

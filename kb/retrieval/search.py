@@ -22,6 +22,7 @@ from kb.collection import resolve_scope
 from kb.config import FINAL_TOP_K, FUSION_TOP_K, RECALL_TOP_K, RRF_K
 from kb.db import get_conn
 from kb.utils import ascii_fold
+from kb.quality import normalize_lexical
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def fts_query(question: str) -> str:
     """
     terms: list[str] = []
 
-    for raw in re.findall(r"\w+", question):
+    for raw in re.findall(r"\w+", normalize_lexical(question)):
         term = ascii_fold(raw).lower()
         if not term:
             continue  # ascii_fold descarta alfabeto sem equivalente (Ω, µ).

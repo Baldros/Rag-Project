@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 from kb.config import FETCH_MAX_CHARS, FINAL_TOP_K
 from kb.db import get_conn
+from kb.quality import decode_quality, for_pages
 from kb.retrieval.expand import Passage, expand_to_sections, to_chunk_passages
 from kb.retrieval.search import Hit, search_chunks
 
@@ -56,7 +57,15 @@ def search(
         else to_chunk_passages(hits)
     )
 
-    return [passage.to_dict() for passage in passages]
+    qualities = {}
+    results = []
+    for passage in passages:
+        if passage.doc_id not in qualities:
+            row = conn.execute("SELECT quality_json FROM documents WHERE doc_id = ?", (passage.doc_id,)).fetchone()
+            qualities[passage.doc_id] = decode_quality(row[0] if row else None)
+        results.append({**passage.to_dict(),
+                        "quality": for_pages(qualities[passage.doc_id], passage.page_start, passage.page_end)})
+    return results
 
 
 def fetch_section(
@@ -68,7 +77,7 @@ def fetch_section(
 
     row = conn.execute(
         """
-        SELECT s.*, d.filename
+        SELECT s.*, d.filename, d.quality_json
           FROM sections s
           JOIN documents d ON d.doc_id = s.doc_id
          WHERE s.section_id = ?
@@ -76,7 +85,11 @@ def fetch_section(
         (section_id,),
     ).fetchone()
 
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["quality"] = for_pages(result.pop("quality_json"), row["page_start"], row["page_end"])
+    return result
 
 
 def fetch_pages(
@@ -114,7 +127,7 @@ def fetch_pages(
     ).fetchall()
 
     document = conn.execute(
-        "SELECT filename, title, n_pages FROM documents WHERE doc_id = ?",
+        "SELECT filename, title, n_pages, quality_json FROM documents WHERE doc_id = ?",
         (doc_id,),
     ).fetchone()
 
@@ -136,6 +149,8 @@ def fetch_pages(
         "filename": document["filename"] if document else None,
         "pages": f"{page_start}-{page_end}" if page_end != page_start else str(page_start),
         "n_chunks": len(kept),
+        "quality": for_pages(document["quality_json"] if document else None, page_start,
+                             max((r["page_end"] or r["page_start"] for r in kept), default=page_end)),
         "text": "\n\n".join(row["text"] for row in kept),
         "headings": list(
             dict.fromkeys(row["heading_path"] for row in kept if row["heading_path"])
@@ -160,7 +175,7 @@ def get_outline(
     conn = conn or get_conn()
 
     document = conn.execute(
-        "SELECT filename, title, n_pages, n_sections, summary, key_topics"
+        "SELECT filename, title, n_pages, n_sections, summary, key_topics, quality_json"
         " FROM documents WHERE doc_id = ?",
         (doc_id,),
     ).fetchone()
@@ -187,6 +202,7 @@ def get_outline(
         "n_pages": document["n_pages"],
         "n_sections": document["n_sections"],
         "summary": document["summary"],
+        "quality": decode_quality(document["quality_json"]),
         "sections": [
             {
                 "section_id": row["section_id"],

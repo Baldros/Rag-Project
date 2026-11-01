@@ -127,19 +127,44 @@ SUPPORTED_EXTENSIONS = {".pdf"}
 
 # Invalida artefatos de parse quando a forma de converter muda. Bump manual ao
 # alterar o pipeline do Docling.
-PARSE_SCHEMA_VERSION = "1"
+PARSE_SCHEMA_VERSION = "2"
+FORMULA_PRESET = "codeformulav2"
+FORMULA_MARGIN = 0.08
+OCR_MODE = os.getenv("KB_OCR", "auto")
 
 
-def parse_version() -> str:
+def _signature(kind: str, values: dict) -> str:
+    import hashlib
+    import json
+    return kind + "-" + hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:20]
+
+
+def _package_versions(*names: str) -> dict[str, str]:
+    from importlib.metadata import PackageNotFoundError, version
+    result = {}
+    for name in names:
+        try:
+            result[name] = version(name)
+        except PackageNotFoundError:
+            result[name] = "unknown"
+    return result
+
+
+def parse_version(ocr: str | None = None) -> str:
     """Assinatura do parse; artefato com assinatura diferente é reprocessado."""
-    try:
-        from importlib.metadata import version as _pkg_version
+    return _signature("parse", {**_package_versions("docling", "docling-core", "docling-parse", "pypdfium2"),
+        "schema": PARSE_SCHEMA_VERSION, "block_size": PAGE_BLOCK_SIZE,
+        "ocr": ocr or OCR_MODE, "backend": "docling_parse", "tables": True})
 
-        docling_version = _pkg_version("docling")
-    except Exception:  # pragma: no cover - docling sempre presente em runtime
-        docling_version = "unknown"
 
-    return f"docling{docling_version}-blk{PAGE_BLOCK_SIZE}-v{PARSE_SCHEMA_VERSION}"
+def formula_version() -> str:
+    return _signature("formula", {**_package_versions("docling", "transformers"),
+        "preset": FORMULA_PRESET, "enabled": True, "margin": FORMULA_MARGIN, "stop_repetition": True})
+
+
+def segment_version() -> str:
+    return _signature("segment", {**_package_versions("docling-core", "transformers"),
+        "schema": "2", "tokenizer": CHUNK_TOKENIZER_MODEL, "max_tokens": CHUNK_MAX_TOKENS})
 
 
 # =========================
@@ -169,3 +194,6 @@ logging.basicConfig(
     level=os.getenv("KB_LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+# Docling logs each already-stopped batch row on every generation step.
+# Keep model/batch timing and warnings without flooding the session log.
+logging.getLogger("docling.models.utils.hf_stopping_criteria").setLevel(logging.WARNING)

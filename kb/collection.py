@@ -19,6 +19,7 @@ from typing import Any, NoReturn, Sequence
 
 from kb.db import get_conn, transaction
 from kb.utils import slugify
+from kb.quality import document_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -364,4 +365,4 @@ def documents_in(
         params.extend((limit if limit is not None else -1, offset))
     rows = conn.execute(query, params).fetchall()
 
-    return [dict(row) for row in rows]
+    return [document_metadata(row) for row in rows]

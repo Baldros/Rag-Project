@@ -4,7 +4,12 @@
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
 
 # Parsing de documentos
-docling>=2.95.0
+docling==2.145.0
+docling-core==2.105.0
+docling-parse==7.24.2
+docling-ibm-models==4.0.4
+pypdfium2==5.8.0
+transformers==5.9.0
 pypdf>=6.11.0
 
 # Persistência

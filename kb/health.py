@@ -84,38 +84,54 @@ def consistency(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Compara o que o SQLite diz estar indexado com o que o índice realmente tem."""
     conn = conn or get_conn()
 
-    expected = int(
-        conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 1").fetchone()[0]
-    )
+    expected_ids = {row[0] for row in conn.execute("SELECT chunk_id FROM chunks WHERE embedded = 1")}
+    expected = len(expected_ids)
 
     try:
         from kb.vectors import get_index
 
-        actual = get_index().count()
+        actual_ids = get_index().ids()
+        actual = len(actual_ids)
     except Exception as exc:
         return {"ok": False, "error": f"índice vetorial inacessível: {exc}"}
 
     drift = actual - expected
 
+    missing, orphaned = expected_ids - actual_ids, actual_ids - expected_ids
+    pending = conn.execute("SELECT COUNT(*) FROM documents WHERE vector_reset_pending = 1").fetchone()[0]
     result: dict[str, Any] = {
-        "ok": drift == 0,
+        "ok": not missing and not orphaned and not pending,
         "sqlite_embedded": expected,
         "vector_index": actual,
         "drift": drift,
+        "missing_count": len(missing), "orphan_count": len(orphaned),
+        "missing_sample": sorted(missing)[:50], "orphan_sample": sorted(orphaned)[:50],
+        "pending_vector_resets": pending,
     }
 
-    if drift < 0:
-        result["hint"] = (
-            "faltam vetores no índice; rode `reindex` para recompor "
-            "(não reprocessa nenhum PDF)"
-        )
-    elif drift > 0:
-        result["hint"] = (
-            "há vetores órfãos no índice, de documentos removidos; "
-            "`reindex --reset` limpa"
-        )
+    if missing or orphaned:
+        result["hint"] = "Execute `reindex --reset` para recompor os vetores a partir do SQLite"
+    elif pending:
+        result["hint"] = "Execute `reindex` para retomar a substituição de vetores pendente"
 
     return result
+
+
+def artifact_health(conn: sqlite3.Connection | None = None) -> list[dict]:
+    from kb.ingest.parse import read_manifest, validate_manifest
+    from kb.quality import decode_quality
+    conn = conn or get_conn()
+    report = []
+    for row in conn.execute("SELECT doc_id, artifact_manifest, quality_json FROM documents"):
+        try:
+            manifest = read_manifest(row["doc_id"], row["artifact_manifest"])
+            valid = validate_manifest(row["doc_id"], manifest)
+            state = "valid" if valid else ("legacy" if manifest and not row["artifact_manifest"] else "invalid")
+        except (ValueError, OSError):
+            state = "invalid"
+        report.append({"doc_id": row["doc_id"], "artifact_status": state,
+                       "quality": decode_quality(row["quality_json"])})
+    return report
 
 
 def orphan_artifacts() -> list[str]:
@@ -224,6 +240,7 @@ def _collection_detail(collection_id: str, conn: sqlite3.Connection) -> dict[str
                 "n_pages": document["n_pages"],
                 "n_chunks": document["n_chunks"],
                 "status": document["status"],
+                "quality": document["quality"],
                 "has_summary": bool(document["summary"]),
             }
             for document in documents

@@ -39,6 +39,8 @@ class VectorIndex(Protocol):
 
     def count(self) -> int: ...
 
+    def ids(self) -> set[str]: ...
+
     def reset(self) -> None: ...
 
     def embedding_identity(self) -> str | None: ...
@@ -118,6 +120,16 @@ class ChromaIndex:
 
     def count(self) -> int:
         return self._collection.count()
+
+    def ids(self) -> set[str]:
+        result: set[str] = set()
+        offset = 0
+        while True:
+            page = self._collection.get(limit=10000, offset=offset, include=[])["ids"]
+            result.update(page)
+            if len(page) < 10000:
+                return result
+            offset += len(page)
 
     def reset(self) -> None:
         """Apaga o índice inteiro. Seguro: é reconstruível a partir do SQLite."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -19,7 +20,8 @@ from kb.config import DB_PATH, STORE_DIR
 # Guardado em PRAGMA user_version. Uma linha por versão, para que a migração
 # diga o que mudou:
 # 1: esquema inicial — collections, documents, sections, chunks, jobs e chunks_fts.
-SCHEMA_VERSION = 1
+# 2: resumable vector replacement, extraction quality and normalized lexical text.
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -43,6 +45,11 @@ CREATE TABLE IF NOT EXISTS documents (
     key_topics    TEXT,                      -- JSON list, preenchido pelo agente
     enriched_at   TEXT,
     parse_version TEXT,
+    formula_version TEXT,
+    segment_version TEXT,
+    artifact_manifest TEXT,
+    quality_json TEXT,
+    vector_reset_pending INTEGER NOT NULL DEFAULT 0,
     embed_model   TEXT,
     status        TEXT NOT NULL DEFAULT 'pending',
     error         TEXT,
@@ -85,6 +92,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     heading_path TEXT,
     text         TEXT NOT NULL,
     embed_text   TEXT NOT NULL,              -- heading_path + text: o que foi embedado
+    search_text TEXT NOT NULL DEFAULT '',
+    search_heading_path TEXT NOT NULL DEFAULT '',
     content_type TEXT NOT NULL DEFAULT 'text',
     embedded     INTEGER NOT NULL DEFAULT 0  -- 0/1: já está no índice vetorial
 );
@@ -92,7 +101,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE TABLE IF NOT EXISTS jobs (
     job_id        TEXT PRIMARY KEY,
     kind          TEXT NOT NULL,
-    status        TEXT NOT NULL,             -- queued|running|done|failed|cancelled
+    status        TEXT NOT NULL,             -- queued|running|done|partial|failed|cancelled
     target        TEXT,
     collection_id TEXT,
     pass_name     TEXT,                      -- parse|embed
@@ -100,6 +109,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     total         INTEGER NOT NULL DEFAULT 0,
     message       TEXT,
     error         TEXT,
+    result_json   TEXT,
     pid           INTEGER,
     created_at    TEXT NOT NULL,
     started_at    TEXT,
@@ -117,28 +127,32 @@ CREATE INDEX IF NOT EXISTS idx_docs_status     ON documents(status);
 
 -- BM25 sobre o mesmo texto, sem duplicá-lo: external content aponta para `chunks`.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    text,
-    heading_path,
+    search_text,
+    search_heading_path,
     content='chunks',
     content_rowid='rowid',
     tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts(rowid, text, heading_path)
-    VALUES (new.rowid, new.text, new.heading_path);
+    UPDATE chunks SET search_text=kb_normalize(new.text),
+        search_heading_path=kb_normalize(new.heading_path) WHERE rowid=new.rowid;
+    INSERT INTO chunks_fts(rowid, search_text, search_heading_path)
+    VALUES (new.rowid, kb_normalize(new.text), kb_normalize(new.heading_path));
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_path)
-    VALUES ('delete', old.rowid, old.text, old.heading_path);
+    INSERT INTO chunks_fts(chunks_fts, rowid, search_text, search_heading_path)
+    VALUES ('delete', old.rowid, old.search_text, old.search_heading_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF text, heading_path ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_path)
-    VALUES ('delete', old.rowid, old.text, old.heading_path);
-    INSERT INTO chunks_fts(rowid, text, heading_path)
-    VALUES (new.rowid, new.text, new.heading_path);
+    INSERT INTO chunks_fts(chunks_fts, rowid, search_text, search_heading_path)
+    VALUES ('delete', old.rowid, old.search_text, old.search_heading_path);
+    UPDATE chunks SET search_text=kb_normalize(new.text),
+        search_heading_path=kb_normalize(new.heading_path) WHERE rowid=new.rowid;
+    INSERT INTO chunks_fts(rowid, search_text, search_heading_path)
+    VALUES (new.rowid, kb_normalize(new.text), kb_normalize(new.heading_path));
 END;
 """
 
@@ -156,6 +170,8 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
 
     conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    from kb.quality import normalize_lexical
+    conn.create_function("kb_normalize", 1, normalize_lexical, deterministic=True)
 
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
@@ -186,10 +202,25 @@ def _upgrade(conn: sqlite3.Connection, version: int) -> None:
     """
     Passos de migração de um banco existente, da menor versão para a maior.
 
-    Ainda não há nenhum: a versão 1 é o esquema que `SCHEMA` cria. O primeiro
-    passo entra aqui como `if version < 2: ...`, e `SCHEMA` muda junto, para
-    que um banco novo já nasça no formato e não passe por este caminho.
+    Executado dentro da transação de migração, inclusive a reconstrução FTS.
     """
+    if version < 2:
+        additions = {
+            "documents": ["formula_version TEXT", "segment_version TEXT", "artifact_manifest TEXT",
+                          "quality_json TEXT", "vector_reset_pending INTEGER NOT NULL DEFAULT 0"],
+            "jobs": ["result_json TEXT"],
+            "chunks": ["search_text TEXT NOT NULL DEFAULT ''", "search_heading_path TEXT NOT NULL DEFAULT ''"],
+        }
+        for table, columns in additions.items():
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column in columns:
+                if column.split()[0] not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+        for name in ("chunks_fts_ai", "chunks_fts_ad", "chunks_fts_au"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        _create_schema(conn)
+        rebuild_fts(conn)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -220,7 +251,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             return  # Outro processo migrou enquanto esperávamos o lock.
 
         if version == 0:
-            _create_schema(conn)
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='documents'").fetchone():
+                _upgrade(conn, 1)
+            else:
+                _create_schema(conn)
         else:
             _upgrade(conn, version)
 
@@ -282,16 +316,21 @@ def transaction(
     `immediate=True` pega o lock de escrita na abertura, em vez de na primeira
     escrita: é o que serializa dois processos que leem para decidir se escrevem.
     """
-    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+    savepoint = "sp_" + uuid.uuid4().hex if conn.in_transaction else None
+    conn.execute(f"SAVEPOINT {savepoint}" if savepoint else ("BEGIN IMMEDIATE" if immediate else "BEGIN"))
     try:
         yield conn
     except BaseException:
-        conn.execute("ROLLBACK")
+        conn.execute(f"ROLLBACK TO {savepoint}" if savepoint else "ROLLBACK")
+        if savepoint:
+            conn.execute(f"RELEASE {savepoint}")
         raise
     else:
-        conn.execute("COMMIT")
+        conn.execute(f"RELEASE {savepoint}" if savepoint else "COMMIT")
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> None:
-    """Reconstrói o índice BM25 a partir de `chunks`."""
-    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+    """Rebuild normalized lexical text and FTS atomically, preserving sources."""
+    with transaction(conn):
+        conn.execute("UPDATE chunks SET search_text=kb_normalize(text), search_heading_path=kb_normalize(heading_path)")
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")

@@ -157,7 +157,7 @@ def _widen(
     return (min(starts) if starts else None, max(ends) if ends else None)
 
 
-def segment_document(doc_id: str) -> tuple[list[SectionRecord], list[ChunkRecord]]:
+def segment_document(doc_id: str, manifest: dict | None = None) -> tuple[list[SectionRecord], list[ChunkRecord]]:
     """
     Lê o artefato do parse e produz sections + chunks.
 
@@ -172,52 +172,60 @@ def segment_document(doc_id: str) -> tuple[list[SectionRecord], list[ChunkRecord
     chunk_ord = 0
     section: SectionRecord | None = None
 
-    for _, _, document in iter_blocks(doc_id):
-        for chunk in chunker.chunk(dl_doc=document):
-            text = (getattr(chunk, "text", "") or "").strip()
-            if not text:
-                continue
+    from docling_core.types.doc import DoclingDocument
 
-            embed_text = chunker.contextualize(chunk).strip() or text
-            heading_path, headings = _heading_path_of(chunk)
-            pages = _pages_of(chunk)
+    # Preserve the heading stack across parse block boundaries. Absolute page
+    # numbers in contiguous blocks are preserved by Docling's concatenate.
+    documents = [document for _, _, document in iter_blocks(doc_id, manifest)]
+    combined = DoclingDocument.concatenate(documents)
+    expected_pages = {page for document in documents for page in document.pages}
+    if set(combined.pages) != expected_pages:
+        raise RuntimeError("A concatenação alterou as páginas do documento")
+    for chunk in chunker.chunk(dl_doc=combined):
+        text = (getattr(chunk, "text", "") or "").strip()
+        if not text:
+            continue
 
-            # Seção nova a cada mudança de heading, e não por texto de heading:
-            # num livro-texto "SOLUÇÃO" se repete depois de cada exemplo, e
-            # agrupar por string funde passagens que não têm relação nenhuma.
-            if section is None or section.heading_path != heading_path:
-                section = SectionRecord(
-                    section_id=stable_id(doc_id, "section", len(sections), heading_path),
-                    doc_id=doc_id,
-                    parent_id=_parent_id(doc_id, headings),
-                    ord=len(sections),
-                    level=len(headings),
-                    heading=headings[-1] if headings else None,
-                    heading_path=heading_path,
-                )
-                sections.append(section)
+        embed_text = chunker.contextualize(chunk).strip() or text
+        heading_path, headings = _heading_path_of(chunk)
+        pages = _pages_of(chunk)
 
-            section.parts.append(text)
-            section.page_start, section.page_end = _widen(
-                (section.page_start, section.page_end), pages
+        # Seção nova a cada mudança de heading, e não por texto de heading:
+        # num livro-texto "SOLUÇÃO" se repete depois de cada exemplo, e
+        # agrupar por string funde passagens que não têm relação nenhuma.
+        if section is None or section.heading_path != heading_path:
+            section = SectionRecord(
+                section_id=stable_id(doc_id, "section", len(sections), heading_path),
+                doc_id=doc_id,
+                parent_id=_parent_id(doc_id, headings),
+                ord=len(sections),
+                level=len(headings),
+                heading=headings[-1] if headings else None,
+                heading_path=heading_path,
             )
+            sections.append(section)
 
-            chunks.append(
-                ChunkRecord(
-                    chunk_id=stable_id(doc_id, "chunk", chunk_ord, heading_path),
-                    doc_id=doc_id,
-                    section_id=section.section_id,
-                    ord=chunk_ord,
-                    page_start=pages[0],
-                    page_end=pages[1],
-                    n_tokens=_count_tokens(embed_text),
-                    heading_path=heading_path,
-                    text=text,
-                    embed_text=embed_text,
-                    content_type=_content_type_of(chunk),
-                )
+        section.parts.append(text)
+        section.page_start, section.page_end = _widen(
+            (section.page_start, section.page_end), pages
+        )
+
+        chunks.append(
+            ChunkRecord(
+                chunk_id=stable_id(doc_id, "chunk", chunk_ord, heading_path),
+                doc_id=doc_id,
+                section_id=section.section_id,
+                ord=chunk_ord,
+                page_start=pages[0],
+                page_end=pages[1],
+                n_tokens=_count_tokens(embed_text),
+                heading_path=heading_path,
+                text=text,
+                embed_text=embed_text,
+                content_type=_content_type_of(chunk),
             )
-            chunk_ord += 1
+        )
+        chunk_ord += 1
 
     _resolve_parents(sections)
 

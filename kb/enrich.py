@@ -241,12 +241,21 @@ def run_pass(
 
     result: dict[str, Any] = {"documents": 0, "sections": 0, "failed": 0, "skipped": None}
 
+    do_sections = ENRICH_SECTIONS if sections is None else sections
+    if not _pending_documents(limit, doc_ids, conn) and not (
+        do_sections and _pending_sections(limit, doc_ids, conn)
+    ):
+        return result
+
+    if not _pending_documents(limit, doc_ids, conn) and not (
+        do_sections and _pending_sections(limit, doc_ids, conn)
+    ):
+        return result
+
     if not llm.is_available():
         result["skipped"] = "LLM indisponível; enriquecimento adiado"
         logger.warning("Pass 3 pulado: %s", result["skipped"])
         return result
-
-    do_sections = ENRICH_SECTIONS if sections is None else sections
 
     try:
         result["documents"] = _enrich_documents(doc_ids, limit, on_progress, conn, llm, result)

@@ -68,7 +68,7 @@ class Runtime:
         }
 
     def _run_job(self, job_id: str, action: str, payload: dict[str, Any]) -> None:
-        from kb.jobs import update_job
+        from kb.jobs import update_job, result_status
 
         update_job(job_id, status="running", pid=os.getpid(), started_at=_now())
 
@@ -87,6 +87,7 @@ class Runtime:
                     payload["paths"], collection_id=payload.get("collection"),
                     on_progress=progress, force=payload.get("force", False),
                     enrich=payload.get("enrich", True),
+                    ocr=payload.get("ocr"),
                 )
             else:
                 self._release_ingestion()
@@ -112,12 +113,11 @@ class Runtime:
 
                 unload_all()  # Also covers an empty reindex after preloading.
                 result = {"invalidated": invalidated, "embedded": embedded}
-            self._prepare_ingestion()
-            failed = action == "ingest" and bool(result["failed"]) and not result["indexed"]
+            status = result_status(result) if action == "ingest" else "done"
             update_job(
-                job_id, status="failed" if failed else "done", finished_at=_now(),
-                pass_name=None, message=str(result)[:300],
-                error=str(result["failed"])[:2000] if failed else None,
+                job_id, status=status, finished_at=_now(), result=result,
+                pass_name=None, message=f"Job {status}; detalhes no campo result",
+                error="Ingestão incompleta; consulte result" if status == "failed" else None,
             )
         except Exception as exc:
             from kb.models import unload_all
@@ -127,12 +127,11 @@ class Runtime:
                 job_id, status="failed", finished_at=_now(), pass_name=None,
                 error=f"{exc}\n{traceback.format_exc()}"[:2000],
             )
+        finally:
             try:
                 self._prepare_ingestion()
             except Exception:
-                # A session whose ready models cannot be restored must end.
                 self.running = False
-        finally:
             self.pass_name = None
             self.job_id = None
 
