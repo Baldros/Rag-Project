@@ -71,16 +71,16 @@ class SchemaVersionTests(unittest.TestCase):
         self.assertEqual(error["code"], "SCHEMA_TOO_NEW")
         self.assertIn("hint", error)
 
-    def test_schema_only_database_is_migrated_without_running_upgrades(self):
+    def test_schema_only_database_is_safely_upgraded(self):
         # O fixture dos outros testes cria o esquema sem estampar a versão.
         with contextlib.closing(sqlite3.connect(self.path)) as conn:
             conn.executescript(db.SCHEMA)
         self.assertEqual(self.version(), 0)
 
-        with patch.object(db, "_upgrade") as upgrade:
+        with patch.object(db, "_upgrade", wraps=db._upgrade) as upgrade:
             db.init_db(self.path).close()
 
-        upgrade.assert_not_called()
+        upgrade.assert_called_once()
         self.assertEqual(self.version(), db.SCHEMA_VERSION)
 
     def test_newer_version_committed_by_another_connection_is_refused(self):
@@ -131,19 +131,19 @@ class SchemaVersionTests(unittest.TestCase):
             conn.execute("INSERT INTO collections VALUES ('c', 'Name', NULL, '2026-01-01')")
 
         def upgrade(conn, version):
-            self.assertEqual(version, 1)
+            self.assertEqual(version, db.SCHEMA_VERSION - 1)
             conn.execute("ALTER TABLE collections ADD COLUMN migrated INTEGER DEFAULT 1")
 
         def open_database(_):
             db.init_db(self.path).close()
 
-        with patch.object(db, "SCHEMA_VERSION", 2), \
+        with patch.object(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1), \
              patch.object(db, "_upgrade", side_effect=upgrade) as upgraded, \
              ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(open_database, range(2)))
 
         upgraded.assert_called_once()
-        self.assertEqual(self.version(), 2)
+        self.assertEqual(self.version(), db.SCHEMA_VERSION + 1)
         with contextlib.closing(db.connect(self.path)) as conn:
             self.assertEqual(tuple(conn.execute(
                 "SELECT collection_id, name, migrated FROM collections").fetchone()),
@@ -158,12 +158,12 @@ class SchemaVersionTests(unittest.TestCase):
                     conn.execute("ALTER TABLE collections ADD COLUMN unfinished TEXT")
                     raise error("Interrupted migration")
 
-                with patch.object(db, "SCHEMA_VERSION", 2), \
+                with patch.object(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1), \
                      patch.object(db, "_upgrade", side_effect=upgrade):
                     with self.assertRaises(error):
                         db.init_db(self.path)
 
-                self.assertEqual(self.version(), 1)
+                self.assertEqual(self.version(), db.SCHEMA_VERSION)
                 with contextlib.closing(db.connect(self.path)) as conn:
                     columns = [row["name"] for row in conn.execute(
                         "PRAGMA table_info(collections)")]

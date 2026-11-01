@@ -28,7 +28,7 @@ def invoke(*args: str) -> tuple[int, dict]:
 
 class CatalogPaginationTests(unittest.TestCase):
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(db.SCHEMA)
         for index in range(3):
@@ -73,7 +73,7 @@ class PageSignalTests(unittest.TestCase):
     """Listagem cheia é indistinguível do fim da lista sem page.has_more."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(db.SCHEMA)
         for index in range(3):
@@ -129,7 +129,7 @@ class IncompleteReadTests(unittest.TestCase):
     """Corte de texto é informado em campo, não só no meio do texto."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(db.SCHEMA)
         self.conn.execute(
@@ -257,7 +257,7 @@ class ScopeContractTests(unittest.TestCase):
     """A collection que não existe é erro; a vazia é escopo válido."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(db.SCHEMA)
         self.conn.execute(
@@ -349,7 +349,7 @@ class LexicalQueryTests(unittest.TestCase):
     """The BM25 channel exists for the exact technical term the vectors miss."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(db.SCHEMA)
         self.conn.execute(
