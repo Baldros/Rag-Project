@@ -264,6 +264,56 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(jobs.result_status({"indexed": [], "skipped": [], "failed": [{}]}), "failed")
 
 
+    def test_partial_reingestion_without_force_retries_and_keeps_prior_data_on_parse_failure(self):
+        self.store("published text")
+        self.conn.execute("UPDATE documents SET status='indexed', summary='saved', quality_json=?, vector_reset_pending=0",
+                          (json.dumps({"status": "partial", "issues": [{"pages": [2]}]}),))
+        self.conn.execute("UPDATE chunks SET embedded=1")
+        self.assertFalse(pipeline.is_indexed("doc", self.conn))
+        with patch.object(pipeline, "expand_paths", return_value=[Path("same.pdf")]), \
+             patch.object(pipeline, "file_sha256", return_value="doc"), \
+             patch.object(pipeline, "get_pdf_page_count", return_value=2), \
+             patch.object(pipeline, "parse_document", side_effect=RuntimeError("retry failed")) as parse_pdf, \
+             patch.object(pipeline, "release_converter"), patch.object(pipeline, "release_chunker"):
+            result = pipeline.ingest_paths(["same.pdf"], conn=self.conn)
+        self.assertFalse(parse_pdf.call_args.kwargs["force"])
+        self.assertEqual(result["failed"][0]["phase"], "parse")
+        self.assertEqual(result["pending"][0]["phase"], "extraction")
+        self.assertEqual(self.conn.execute("SELECT summary FROM documents").fetchone()[0], "saved")
+        self.assertEqual(tuple(self.conn.execute("SELECT text, embedded FROM chunks").fetchone()),
+                         ("published text", 1))
+
+    def test_unfilled_summary_is_partial_even_without_reported_generation_error(self):
+        from kb import enrich
+        self.store()
+        self.conn.execute("UPDATE documents SET status='indexed', vector_reset_pending=0, quality_json=?",
+                          (json.dumps({"status": "complete"}),))
+        self.conn.execute("UPDATE chunks SET embedded=1")
+        job_id = jobs.create_job("ingest", "same.pdf", conn=self.conn)
+        jobs.update_job(job_id, status="running", conn=self.conn)
+
+        def checkpoint(snapshot):
+            jobs.update_job(job_id, result=snapshot, conn=self.conn)
+
+        def enrichment(**kwargs):
+            self.assertEqual(self.conn.execute("SELECT status FROM documents").fetchone()[0], "indexed")
+            job = jobs.get_job(job_id, self.conn)
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(job["result"]["pending"][0]["phase"], "enrich")
+            return {"documents": 0, "sections": 0, "failed": 0}
+
+        with patch.object(pipeline, "expand_paths", return_value=[Path("same.pdf")]), \
+             patch.object(pipeline, "file_sha256", return_value="doc"), \
+             patch.object(pipeline, "is_indexed", return_value=True), \
+             patch.object(pipeline, "embed_pending", return_value=0), \
+             patch.object(pipeline, "release_converter"), patch.object(pipeline, "release_chunker"), \
+             patch.object(enrich, "run_pass", side_effect=enrichment):
+            result = pipeline.ingest_paths(["same.pdf"], conn=self.conn, on_checkpoint=checkpoint)
+        self.assertEqual(jobs.result_status(result), "partial")
+        self.assertEqual(result["pending_inputs"], [])
+        self.assertTrue(result["pending"][0]["document_summary"])
+
+
 class MigrationTests(unittest.TestCase):
     def test_real_v1_migration_preserves_sources_summaries_vectors_and_collections(self):
         with contextlib.closing(db.connect(":memory:")) as conn:
@@ -274,7 +324,7 @@ class MigrationTests(unittest.TestCase):
             conn.execute("INSERT INTO document_collections VALUES ('d', 'c', 'now')")
             conn.execute("INSERT INTO chunks(chunk_id, doc_id, ord, text, embed_text, embedded) VALUES ('k', 'd', 0, 'Estat´ ısticas', 'Estat´ ısticas', 1)")
             db._migrate(conn)
-            self.assertEqual(db._schema_version(conn), 2)
+            self.assertEqual(db._schema_version(conn), db.SCHEMA_VERSION)
             self.assertEqual(tuple(conn.execute("SELECT text, search_text, embedded FROM chunks").fetchone()),
                              ("Estat´ ısticas", "Estatísticas", 1))
             self.assertEqual(tuple(conn.execute("SELECT source_path, summary, status, quality_json FROM documents").fetchone()),

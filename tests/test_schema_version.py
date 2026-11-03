@@ -180,5 +180,27 @@ class SchemaVersionTests(unittest.TestCase):
                              .fetchone()[0], 0)
 
 
+class JobMigrationTests(unittest.TestCase):
+    def test_v2_jobs_migration_preserves_results_and_recovers_legacy_queued(self):
+        from kb import jobs
+
+        # Use the actual old job layout, rather than relabeling a new schema.
+        old = (Path(__file__).parent / "schema_v1.sql").read_text(encoding="utf-8")
+        with contextlib.closing(db.connect(":memory:")) as conn:
+            conn.executescript(old)
+            conn.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT")
+            conn.execute("PRAGMA user_version=2")
+            conn.execute("INSERT INTO jobs(job_id, kind, status, created_at, finished_at, result_json) "
+                         "VALUES ('done', 'ingest', 'partial', 'created', 'finished', '{\"saved\":true}')")
+            conn.execute("INSERT INTO jobs(job_id, kind, status, created_at) VALUES ('queued', 'ingest', 'queued', 'created')")
+            db._migrate(conn)
+            done = jobs.get_job("done", conn)
+            self.assertEqual(done["status"], "partial")
+            self.assertEqual(done["result"], {"saved": True})
+            self.assertEqual(done["finished_at"], "finished")
+            self.assertEqual(done["cleanup_status"], "unconfirmed")
+            self.assertEqual(jobs.get_job("queued", conn)["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
