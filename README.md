@@ -50,13 +50,22 @@ trocar de modo. `on` no modo já ativo é idempotente. A comunicação com o pro
 local é privada e autenticada; não há servidor de rede público.
 
 Uma ingestão executa parse, embedding e enriquecimento em sequência, liberando
-um modelo antes de carregar o próximo. O parser volta a ficar pronto ao fim do
-job. `ingest` espera o resultado por padrão; `--background` devolve um `job_id`.
+um modelo antes de carregar o próximo. A limpeza do job termina antes de publicar
+o estado terminal. O parser é preparado novamente quando uma nova ingestão
+precisa dele, sem recarga incondicional ao terminar. A sessão permanece no modo
+escolhido; não há troca automática, desligamento automático ou prazo de inatividade.
+Em `interaction`, embedding e reranker continuam carregados entre perguntas,
+até `off` ou `switch` explícito. `ingest` espera o resultado por padrão;
+`--background` devolve um `job_id` e o processo continua independente do cliente.
 `off` e `switch` aguardam o job ativo. Em um terminal interativo, oferecem
 esperar ou cancelar; `--wait` dispensa a pergunta e `--cancel` cancela
 imediatamente. Cancelar encerra a sessão; a ingestão pode ser retomada depois.
 Para chamadas automatizadas, `off --no-wait` e `switch --no-wait` retornam
 `BUSY` se houver job ativo, sem interrompê-lo nem aguardar sua conclusão.
+Admissão de trabalho e transições de modo usam o mesmo lock entre clientes.
+`jobs cancel JOB_ID` cancela somente esse job: se já terminou ou foi substituído,
+retorna `JOB_NOT_ACTIVE`. A intenção de cancelar é gravada antes de encerrar o
+processo, e o estado `cancelled` é publicado após a tentativa de limpeza externa.
 
 ## Extração e qualidade
 
@@ -99,7 +108,41 @@ que ficaram pendentes. `jobs show JOB_ID` devolve o resultado estruturado comple
 incluindo erros e tempos por pass. Na espera síncrona, `partial` retorna
 `JOB_PARTIAL` com instrução para consultar o job.
 
-O esquema SQLite 2 migra o FTS numa transação, mantendo fontes, resumos,
+`indexed` no catálogo significa que os vetores estão disponíveis; o enriquecimento
+ainda pode estar em andamento. O fim da operação é dado pelo **job**, não pelo
+catálogo. `running`, `cancelling` e `finalizing` ainda são estados ativos.
+`result.pending` detalha pendências de extração, vetores e resumos solicitados;
+`prepared` identifica documentos já publicados e `pending_inputs` lista arquivos
+ainda não processados no último checkpoint. Checkpoints são gravados por documento
+e entre fases; após queda, podem anteceder as últimas gravações no catálogo.
+
+Reingerir o mesmo PDF de qualidade `partial`, **mesmo sem `--force`**, mantém o
+comportamento de tentar melhorar a extração: reutiliza blocos compatíveis, tenta
+fórmulas pendentes e pode refazer segmentação e embeddings. Isso pode ser demorado.
+`--force` também ignora o cache de parse. `--no-enrich` só pula os resumos, não as
+tentativas de extração. Para apenas usar o material já disponível, consulte-o;
+uma nova ingestão é uma nova execução explícita. Falhas de parse antes da publicação
+preservam a versão anterior e seus resumos. Qualidade parcial continua visível nos resultados.
+
+Jobs novos registram PID e identidade de criação do processo antes de retornar
+`queued`, protegendo contra reutilização de PID no Windows e Linux. Na inicialização
+do runtime e nas leituras de jobs, uma única rotina recupera órfãos como `failed`,
+ou `cancelled` quando a intenção de cancelar foi persistida. Não há retomada
+automática. `jobs list`, `jobs show`, `status` e a indicação de trabalho ativo usam
+essa recuperação. Falha de comunicação ou permissão não prova que o processo morreu.
+Registros antigos sem identidade de criação só permitem detectar a ausência do PID.
+
+`finished_at` e o resultado terminal são duráveis e não podem ser sobrescritos por
+um worker atrasado. `cleanup_status` informa `done`, `failed` ou `unconfirmed`;
+`pending` indica que a finalização ainda não ocorreu. Falha de limpeza em execução
+normal termina o job como `failed`, preservando seu resultado. Após queda, recursos
+externos como o Ollama podem continuar residentes: a recuperação registra
+`unconfirmed` e não descarrega modelos de outra sessão. O controle do Ollama não
+isola aplicações externas que usem o mesmo modelo. Não foi adicionado mecanismo de
+notificação; o resultado continua consultável pelo `job_id`.
+
+O esquema SQLite 3 acrescenta identidade, cancelamento e limpeza dos jobs; a
+migração da versão 1 também atualiza o FTS numa transação, mantendo fontes, resumos,
 collections e marcações de embedding. Antes de atualizar uma base existente,
 desligue a sessão e faça backup de SQLite, Chroma e artefatos.
 
