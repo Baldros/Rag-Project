@@ -21,7 +21,8 @@ from kb.config import DB_PATH, STORE_DIR
 # diga o que mudou:
 # 1: esquema inicial — collections, documents, sections, chunks, jobs e chunks_fts.
 # 2: resumable vector replacement, extraction quality and normalized lexical text.
-SCHEMA_VERSION = 2
+# 3: process ownership, durable cancellation and cleanup outcomes for jobs.
+SCHEMA_VERSION = 3
 
 
 SCHEMA = """
@@ -101,7 +102,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE TABLE IF NOT EXISTS jobs (
     job_id        TEXT PRIMARY KEY,
     kind          TEXT NOT NULL,
-    status        TEXT NOT NULL,             -- queued|running|done|partial|failed|cancelled
+    status        TEXT NOT NULL,             -- queued|running|cancelling|finalizing|done|partial|failed|cancelled
     target        TEXT,
     collection_id TEXT,
     pass_name     TEXT,                      -- parse|embed
@@ -111,6 +112,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     error         TEXT,
     result_json   TEXT,
     pid           INTEGER,
+    owner_started TEXT,
+    cancel_requested_at TEXT,
+    cancel_pid INTEGER,
+    cancel_owner_started TEXT,
+    cleanup_status TEXT NOT NULL DEFAULT 'pending',
+    cleanup_error TEXT,
     created_at    TEXT NOT NULL,
     started_at    TEXT,
     finished_at   TEXT
@@ -221,6 +228,18 @@ def _upgrade(conn: sqlite3.Connection, version: int) -> None:
         conn.execute("DROP TABLE IF EXISTS chunks_fts")
         _create_schema(conn)
         rebuild_fts(conn)
+
+    if version < 3:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for column in (
+            "owner_started TEXT", "cancel_requested_at TEXT", "cancel_pid INTEGER",
+            "cancel_owner_started TEXT", "cleanup_status TEXT NOT NULL DEFAULT 'pending'",
+            "cleanup_error TEXT",
+        ):
+            if column.split()[0] not in existing:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {column}")
+        conn.execute("UPDATE jobs SET cleanup_status = 'unconfirmed' "
+                     "WHERE status IN ('done', 'partial', 'failed', 'cancelled')")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

@@ -193,6 +193,9 @@ def status(
                 "pass": job["pass_name"],
                 "progress": f"{job['progress']}/{job['total']}",
                 "message": job["message"],
+                "finished_at": job["finished_at"],
+                "cleanup_status": job["cleanup_status"],
+                "error": job["error"],
             }
             for job in list_jobs(5, conn)
         ],

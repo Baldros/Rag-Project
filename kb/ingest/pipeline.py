@@ -193,6 +193,7 @@ def ingest_paths(
     enrich: bool = True,
     conn: sqlite3.Connection | None = None,
     ocr: str | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """
     Executa a ingestão completa e devolve o resumo do que aconteceu.
@@ -212,6 +213,9 @@ def ingest_paths(
         "failed": [],
         "n_chunks": 0,
         "n_sections": 0,
+        "prepared": [],
+        "pending_inputs": [str(path) for path in files],
+        "enrichment_requested": enrich,
     }
 
     if not files:
@@ -219,15 +223,26 @@ def ingest_paths(
         return result
 
     touched: list[str] = []
-    prepared: list[dict] = []
+    prepared: list[dict] = result["prepared"]
     started = time.monotonic()
     result["timings"] = {}
+
+    def checkpoint() -> None:
+        result["pending"] = pending_work(result, conn)
+        if on_checkpoint:
+            on_checkpoint(result)
+
+    def progress(phase: str, done: int, total: int, message: str) -> None:
+        checkpoint()
+        if on_progress:
+            on_progress(phase, done, total, message)
+
+    checkpoint()
 
     # ---------- Pass 1: Docling ----------
     try:
         for index, pdf_path in enumerate(files, start=1):
-            if on_progress:
-                on_progress("parse", index - 1, len(files), pdf_path.name)
+            progress("parse", index - 1, len(files), pdf_path.name)
             doc_id = None
             try:
                 doc_id = file_sha256(pdf_path)
@@ -288,11 +303,15 @@ def ingest_paths(
                     {"doc_id": doc_id, "filename": pdf_path.name, "phase": "parse",
                      "error": str(exc), **({"manifest": exc.manifest} if hasattr(exc, "manifest") else {})}
                 )
+            finally:
+                result["pending_inputs"].remove(str(pdf_path))
+                checkpoint()
     finally:
         # Libera a GPU antes do Pass 2: a regra é um modelo por vez.
         release_converter()
         release_chunker()
     result["timings"]["parse_segment"] = round(time.monotonic() - started, 3)
+    checkpoint()
 
     # ---------- Pass 2: bge-m3 ----------
     # `embed_pending` descarrega o embedder ao terminar, liberando a GPU para o
@@ -304,7 +323,7 @@ def ingest_paths(
             result["n_embedded"] = embed_pending(
                 doc_ids=touched,
                 on_progress=lambda done, total, msg: (
-                    on_progress("embed", done, total, msg) if on_progress else None
+                    progress("embed", done, total, msg)
                 ), conn=conn,
             )
         except Exception as exc:
@@ -324,19 +343,19 @@ def ingest_paths(
                 result["failed"].append({**item, "phase": "embed", "error": embed_error or "Embedding incompleto"})
         result["skipped"] = [i for i in result["skipped"] if i["doc_id"] in successful]
         touched = successful
+        checkpoint()
 
     # ---------- Pass 3: LLM local ----------
     if touched and enrich:
         from kb.enrich import run_pass
 
-        if on_progress:
-            on_progress("enrich", 0, 1, "iniciando resumos")
+        progress("enrich", 0, 1, "iniciando resumos")
         enrich_started = time.monotonic()
         try:
             result["enrichment"] = run_pass(
                 doc_ids=touched,
                 on_progress=lambda done, total, msg: (
-                    on_progress("enrich", done, total, msg) if on_progress else None
+                    progress("enrich", done, total, msg)
                 ), conn=conn,
             )
         except Exception as exc:
@@ -344,7 +363,37 @@ def ingest_paths(
         result["timings"]["enrich"] = round(time.monotonic() - enrich_started, 3)
 
     result["timings"]["total"] = round(time.monotonic() - started, 3)
+    checkpoint()
     return result
+
+
+def pending_work(result: dict, conn: sqlite3.Connection) -> list[dict]:
+    """Describe missing work without confusing catalog availability with success."""
+    from kb.config import ENRICH_SECTIONS, ENRICH_MIN_SECTION_CHARS
+
+    pending = []
+    doc_ids = {item.get("doc_id") for key in ("prepared", "indexed", "skipped", "failed")
+               for item in result.get(key, []) if item.get("doc_id")}
+    for doc_id in sorted(doc_ids):
+        row = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+        if not row:
+            continue
+        quality = decode_quality(row["quality_json"])
+        if quality.get("status") == "partial":
+            pending.append({"doc_id": doc_id, "phase": "extraction", "quality": quality})
+        chunks = conn.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ? AND embedded = 0",
+                              (doc_id,)).fetchone()[0]
+        if chunks or row["vector_reset_pending"]:
+            pending.append({"doc_id": doc_id, "phase": "embed", "chunks": chunks,
+                            "vector_reset_pending": bool(row["vector_reset_pending"])})
+        if result.get("enrichment_requested"):
+            sections = conn.execute("SELECT COUNT(*) FROM sections WHERE doc_id = ? "
+                                    "AND summary IS NULL AND n_chars >= ?",
+                                    (doc_id, ENRICH_MIN_SECTION_CHARS)).fetchone()[0] if ENRICH_SECTIONS else 0
+            if row["summary"] is None or sections:
+                pending.append({"doc_id": doc_id, "phase": "enrich",
+                                "document_summary": row["summary"] is None, "sections": sections})
+    return pending
 
 
 def _associate(

@@ -146,6 +146,7 @@ class OllamaAdapter:
 
 
 _adapter = None
+_needs_unload = False
 
 
 def _provider():
@@ -162,11 +163,17 @@ def is_available() -> bool:
 
 
 def generate(prompt: str, system: str | None = None, max_tokens: int = 700) -> str:
+    global _needs_unload
+    _needs_unload = True  # A failed request may still have loaded the remote model.
     return _provider().generate(prompt, system, max_tokens)
 
 
 def unload(force: bool = False) -> bool:
     """Unload a model used by this process, or by a cancelled runtime."""
-    if _adapter is None and not force:
-        return False
-    return _provider().unload()
+    global _needs_unload
+    if not _needs_unload and not force:
+        return True
+    unloaded = _provider().unload()
+    if unloaded:
+        _needs_unload = False
+    return unloaded

@@ -219,10 +219,7 @@ def _run(args: argparse.Namespace) -> Any:
         if args.action == "show":
             return get_job(args.job_id) or _missing("job", args.job_id)
         if args.action == "cancel":
-            active = session.status()
-            if active.get("job_id") != args.job_id:
-                raise SessionError("JOB_NOT_ACTIVE", f"Job {args.job_id} não está ativo")
-            return session.stop(cancel=True)
+            return session.stop(cancel=True, expected_job_id=args.job_id)
     raise SessionError("USAGE_ERROR", f"Comando desconhecido: {cmd}")
 
 
@@ -268,7 +265,8 @@ def build_parser() -> JsonParser:
                    help="collection de destino, criada se não existir")
     p.add_argument("--collection-name", metavar="NOME",
                    help="nome legível da collection, quando ela for criada")
-    p.add_argument("--force", action="store_true", help="reprocessa documento já indexado")
+    p.add_argument("--force", action="store_true",
+                   help="ignora cache de parse; qualidade partial já tenta retomar mesmo sem --force")
     p.add_argument("--no-enrich", action="store_true", help="não gera resumos com o LLM")
     p.add_argument("--ocr", choices=["auto", "off", "full"], default=None,
                    help="OCR automático, desligado ou em todas as páginas; fórmulas sempre ativas")

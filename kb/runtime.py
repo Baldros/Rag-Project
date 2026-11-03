@@ -18,6 +18,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class _JobCancelled(BaseException):
+    """Stop at a phase boundary without being swallowed as a document error."""
+
+
 class Runtime:
     def __init__(self, mode: str, nonce: str) -> None:
         self.mode = mode
@@ -26,12 +30,20 @@ class Runtime:
         self.job_id: str | None = None
         self.job_thread: threading.Thread | None = None
         self.pass_name: str | None = None
+        self._job_lock = threading.RLock()
+        self._cancelling = False
 
     def prepare(self) -> None:
         from kb.providers import validate_config
 
         validate_config()
-        init_db().close()
+        from kb.jobs import reconcile
+
+        conn = init_db()
+        try:
+            reconcile(conn)
+        finally:
+            conn.close()
         if self.mode == "interaction":
             from kb.config import RERANK_ENABLED
             from kb.models import preload
@@ -68,18 +80,23 @@ class Runtime:
         }
 
     def _run_job(self, job_id: str, action: str, payload: dict[str, Any]) -> None:
-        from kb.jobs import update_job, result_status
-
-        update_job(job_id, status="running", pid=os.getpid(), started_at=_now())
+        from kb.jobs import update_job, result_status, finish_job
 
         def progress(phase: str, done: int, total: int, message: str) -> None:
-            self.pass_name = phase
-            update_job(
-                job_id, pass_name=phase, progress=done, total=total,
-                message=message[:300],
-            )
+            with self._job_lock:
+                if self._cancelling or not update_job(
+                    job_id, pass_name=phase, progress=done, total=total,
+                    message=message[:300],
+                ):
+                    raise _JobCancelled()
+                self.pass_name = phase
 
+        result = None
+        status = "failed"
+        error = None
         try:
+            if not update_job(job_id, status="running", started_at=_now()):
+                return
             if action == "ingest":
                 from kb.ingest.pipeline import ingest_paths
 
@@ -88,6 +105,7 @@ class Runtime:
                     on_progress=progress, force=payload.get("force", False),
                     enrich=payload.get("enrich", True),
                     ocr=payload.get("ocr"),
+                    on_checkpoint=lambda snapshot: update_job(job_id, result=snapshot),
                 )
             else:
                 self._release_ingestion()
@@ -103,43 +121,81 @@ class Runtime:
                 if reset:
                     EMBEDDER.load()  # Validate load before replacing derived vectors.
                 invalidated = reset_embeddings(doc_ids) if reset else 0
-                embedded = embed_pending(
-                    doc_ids=doc_ids,
-                    on_progress=lambda done, total, message: progress(
-                        "embed", done, total, message
-                    ),
-                )
-                from kb.models import unload_all
+                result = {"invalidated": invalidated, "embedded": 0}
+                update_job(job_id, result=result)
 
-                unload_all()  # Also covers an empty reindex after preloading.
-                result = {"invalidated": invalidated, "embedded": embedded}
+                def reindex_progress(done: int, total: int, message: str) -> None:
+                    result["embedded"] = done
+                    update_job(job_id, result=result)
+                    progress("embed", done, total, message)
+
+                result["embedded"] = embed_pending(doc_ids=doc_ids, on_progress=reindex_progress)
             status = result_status(result) if action == "ingest" else "done"
-            update_job(
-                job_id, status=status, finished_at=_now(), result=result,
-                pass_name=None, message=f"Job {status}; detalhes no campo result",
-                error="Ingestão incompleta; consulte result" if status == "failed" else None,
-            )
-        except Exception as exc:
-            from kb.models import unload_all
-
-            unload_all()
-            update_job(
-                job_id, status="failed", finished_at=_now(), pass_name=None,
-                error=f"{exc}\n{traceback.format_exc()}"[:2000],
-            )
+            if status == "failed":
+                error = "Ingestão incompleta; consulte result"
+        except BaseException as exc:
+            error = f"{exc}\n{traceback.format_exc()}"[:2000]
         finally:
             try:
-                self._prepare_ingestion()
-            except Exception:
-                self.running = False
-            self.pass_name = None
-            self.job_id = None
+                update_job(job_id, status="finalizing", error=error,
+                           **({"result": result} if result is not None else {}))
+                cleanup_errors = self._cleanup_job()
+                with self._job_lock:
+                    # Once cancellation is accepted the controller owns finalization.
+                    if not self._cancelling:
+                        finish_job(
+                            job_id, "failed" if cleanup_errors else status,
+                            cleanup_status="failed" if cleanup_errors else "done",
+                            cleanup_error="; ".join(cleanup_errors) or None,
+                            error=error or ("Falha na limpeza de recursos" if cleanup_errors else None),
+                            message="Job finalizado; detalhes no campo result",
+                        )
+                        self.pass_name = None
+                        self.job_id = None
+            except BaseException:
+                # A failed durable write must never leave an apparently idle
+                # runtime accepting more jobs. Exit so recovery can reconcile it.
+                traceback.print_exc()
+                os._exit(1)
+
+    def _cleanup_job(self) -> list[str]:
+        from kb.ingest.parse import release_converter
+        from kb.ingest.segment import release_chunker
+        from kb.models import unload_all
+        from kb import llm
+
+        errors = []
+        for name, release in (("parser", release_converter), ("chunker", release_chunker),
+                              ("models", unload_all), ("generation", llm.unload)):
+            try:
+                if release() is False:
+                    errors.append(f"{name}: descarga não confirmada")
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        return errors
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._job_lock:
+            return self._handle(request)
+
+    def _handle(self, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
         payload = request.get("payload") or {}
         if action == "ping":
             return self.ping()
+        if action == "cancel":
+            from kb.jobs import request_cancel
+
+            job_id = payload["job_id"]
+            if self.job_id != job_id or not request_cancel(
+                job_id, payload["cancel_pid"], payload["cancel_owner_started"],
+            ):
+                raise SessionError("JOB_NOT_ACTIVE", f"Job {job_id} não está ativo")
+            self._cancelling = True
+            self.running = False  # Refuse subsequent work even if the controller disconnects.
+            return {"job_id": job_id}
+        if not self.running:
+            raise SessionError("SESSION_STOPPING", "Sessão está encerrando")
         if action == "shutdown":
             if self.job_id:
                 raise SessionError("BUSY", "Job em andamento; aguarde ou cancele")
@@ -177,11 +233,19 @@ class Runtime:
                 collection_id=payload.get("collection"),
             )
             self.job_id = job_id
-            self.job_thread = threading.Thread(
-                target=self._run_job, args=(job_id, action, payload),
-                name=f"kb-{action}-{job_id}", daemon=True,
-            )
-            self.job_thread.start()
+            try:
+                self.job_thread = threading.Thread(
+                    target=self._run_job, args=(job_id, action, payload),
+                    name=f"kb-{action}-{job_id}", daemon=True,
+                )
+                self.job_thread.start()
+            except BaseException as exc:
+                from kb.jobs import finish_job
+
+                finish_job(job_id, "failed", error=f"Falha ao iniciar worker: {exc}",
+                           cleanup_status="done")
+                self.job_id = None
+                raise
             return {"job_id": job_id, "status": "queued"}
         raise SessionError("WRONG_MODE", f"Operação {action} indisponível em {self.mode}")
 
@@ -227,8 +291,16 @@ def main() -> None:
                         reply = {"ok": False, "error": {
                             "code": "RUNTIME_ERROR", "message": str(exc),
                         }}
-                    connection.send({"nonce": runtime.nonce, **reply})
+                    try:
+                        connection.send({"nonce": runtime.nonce, **reply})
+                    except (BrokenPipeError, EOFError, OSError):
+                        # The accepted job belongs to the runtime, not its caller.
+                        pass
     finally:
+        if runtime._cancelling:
+            # No cleanup may race the still-running ingestion thread. The
+            # cancellation controller waits for exit before external cleanup.
+            os._exit(0)
         runtime.close()
 
 

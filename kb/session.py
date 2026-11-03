@@ -120,6 +120,13 @@ def status() -> dict[str, Any]:
 
 
 def call(mode: str, action: str, **payload: Any) -> dict[str, Any]:
+    # Admissions and mode transitions share a lock across CLI clients. Waiting
+    # for an ingestion job happens after this request has released the lock.
+    with _locked():
+        return _call_locked(mode, action, **payload)
+
+
+def _call_locked(mode: str, action: str, **payload: Any) -> dict[str, Any]:
     state = _read_state()
     live = _probe(state)
     if not live or not state:
@@ -156,6 +163,7 @@ def _start_locked(mode: str) -> dict[str, Any]:
             f"Execute `kb switch --mode {mode}`",
         )
     if old:
+        _require_dead(old)
         STATE_PATH.unlink(missing_ok=True)
 
     state = {
@@ -187,6 +195,11 @@ def _start_locked(mode: str) -> dict[str, Any]:
         while time.monotonic() < deadline:
             live = _probe(state)
             if live:
+                from kb import processes
+
+                state["pid"] = live["pid"]
+                state["owner_started"] = processes.identity(live["pid"])
+                _write_state(state)
                 return live
             if process.poll() is not None:
                 detail = _last_log_error()
@@ -280,22 +293,38 @@ def _await_exit(pid: int, handle, timeout: float = 60) -> bool:
         wait.restype = wintypes.DWORD
         return wait(handle, int(timeout * 1000)) == 0
     deadline = time.monotonic() + timeout
+    from kb import processes
+
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not processes.alive(pid, None):
             return True
         time.sleep(0.1)
     return False
 
 
-def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False) -> dict[str, Any]:
+def _require_dead(state: dict[str, Any]) -> None:
+    from kb import processes
+
+    if processes.alive(state.get("pid"), state.get("owner_started")):
+        raise SessionError("SESSION_UNREACHABLE", "Processo existe, mas a sessão não respondeu",
+                           "Não é seguro iniciar outra sessão ou descartar a existente")
+
+
+def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False,
+                 expected_job_id: str | None = None) -> dict[str, Any]:
     state = _read_state()
     live = _probe(state)
     if not state or not live:
+        if state:
+            _require_dead(state)
+        if expected_job_id:
+            raise SessionError("JOB_NOT_ACTIVE", f"Job {expected_job_id} não está ativo")
         STATE_PATH.unlink(missing_ok=True)
         return {"active": False, "already_off": True}
     job_id = live.get("job_id")
+    if expected_job_id and job_id != expected_job_id:
+        raise SessionError("JOB_NOT_ACTIVE", f"Job {expected_job_id} não está ativo")
+    selected_job_id = job_id
     if job_id and not cancel:
         if fail_if_busy:
             raise SessionError("BUSY", f"Job {job_id} em andamento",
@@ -303,13 +332,23 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False) ->
         cancel = _decision(state, interactive)
     latest = _probe(state)
     if latest is None:
+        _require_dead(state)
         STATE_PATH.unlink(missing_ok=True)
         return {"active": False, "already_off": True}
     job_id = latest.get("job_id")
+    if (expected_job_id and job_id != expected_job_id) or (cancel and job_id and job_id != selected_job_id):
+        raise SessionError("JOB_NOT_ACTIVE", f"Job {expected_job_id or selected_job_id} não está ativo")
     runtime_pid = int(latest["pid"])
     model_unload_failed = False
     with _process_target(runtime_pid) as handle:
         if cancel and job_id:
+            from kb import processes
+            from kb.jobs import finish_job, get_job
+
+            cancel_pid, cancel_started = processes.current()
+            # Atomically fence admissions and persist intent before terminating.
+            _request(state, "cancel", job_id=job_id, cancel_pid=cancel_pid,
+                     cancel_owner_started=cancel_started)
             # The authenticated pipe proved the identity before opening the handle.
             if os.name == "nt":
                 import ctypes
@@ -319,16 +358,24 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False) ->
                 terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
                 terminate(handle, 1)
             else:
-                os.kill(runtime_pid, signal.SIGTERM)
+                try:
+                    os.kill(runtime_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass  # Runtime may exit itself immediately after acknowledging.
             if not _await_exit(runtime_pid, handle):
                 raise SessionError("STOP_TIMEOUT", "Não consegui encerrar a sessão")
-            from kb.jobs import update_job
-
-            update_job(job_id, status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-            if latest.get("pass_name") == "enrich":
+            # Read the persisted phase after exit: it may have changed after ping.
+            cancelled = get_job(job_id)
+            if cancelled and cancelled.get("pass_name") == "enrich":
                 from kb import llm
 
-                model_unload_failed = not llm.unload(force=True)
+                try:
+                    model_unload_failed = not llm.unload(force=True)
+                except Exception:
+                    model_unload_failed = True
+            finish_job(job_id, "cancelled",
+                       cleanup_status="failed" if model_unload_failed else "done",
+                       cleanup_error="Descarga do modelo de geração não confirmada" if model_unload_failed else None)
         else:
             while job_id:
                 time.sleep(0.5)
@@ -348,9 +395,9 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False) ->
 
 
 def stop(cancel: bool = False, interactive: bool = False,
-         fail_if_busy: bool = False) -> dict[str, Any]:
+         fail_if_busy: bool = False, expected_job_id: str | None = None) -> dict[str, Any]:
     with _locked():
-        return _stop_locked(cancel, interactive, fail_if_busy)
+        return _stop_locked(cancel, interactive, fail_if_busy, expected_job_id)
 
 
 def switch(mode: str, cancel: bool = False, interactive: bool = False,

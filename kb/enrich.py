@@ -247,11 +247,6 @@ def run_pass(
     ):
         return result
 
-    if not _pending_documents(limit, doc_ids, conn) and not (
-        do_sections and _pending_sections(limit, doc_ids, conn)
-    ):
-        return result
-
     if not llm.is_available():
         result["skipped"] = "LLM indisponível; enriquecimento adiado"
         logger.warning("Pass 3 pulado: %s", result["skipped"])
@@ -265,7 +260,7 @@ def run_pass(
     finally:
         # Descarrega antes de devolver o controle: o pass acabou, a VRAM não
         # deve ficar ocupada pelo modelo mais pesado do sistema.
-        llm.unload()
+        result["cleanup_confirmed"] = llm.unload()
 
     logger.info("Pass 3 concluído: %s", result)
     return result

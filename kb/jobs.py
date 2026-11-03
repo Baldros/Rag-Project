@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import json
-import os
-import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +11,11 @@ from typing import Any, Sequence
 
 from kb.config import ALLOWED_INGEST_ROOTS
 from kb.db import get_conn, transaction
+from kb import processes
 
 logger = logging.getLogger(__name__)
+ACTIVE = ("queued", "running", "cancelling", "finalizing")
+TERMINAL = ("done", "partial", "failed", "cancelled")
 
 
 class PathNotAllowed(ValueError):
@@ -58,20 +59,25 @@ def create_job(
 ) -> str:
     conn = conn or get_conn()
     job_id = uuid.uuid4().hex[:12]
+    pid, started = processes.current()
 
     with transaction(conn):
         conn.execute(
-            "INSERT INTO jobs(job_id, kind, status, target, collection_id, total, created_at)"
-            " VALUES (?, ?, 'queued', ?, ?, ?, ?)",
-            (job_id, kind, target, collection_id, total, _now()),
+            "INSERT INTO jobs(job_id, kind, status, target, collection_id, total, created_at, pid, owner_started)"
+            " VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+            (job_id, kind, target, collection_id, total, _now(), pid, started),
         )
 
     return job_id
 
 
-def update_job(job_id: str, conn=None, **fields: Any) -> None:
+def update_job(job_id: str, conn=None, **fields: Any) -> bool:
     if not fields:
-        return
+        return False
+
+    if fields.get("status") in TERMINAL:
+        status = fields.pop("status")
+        return finish_job(job_id, status, conn=conn, **fields)
 
     conn = conn or get_conn()
     if "result" in fields:
@@ -79,35 +85,88 @@ def update_job(job_id: str, conn=None, **fields: Any) -> None:
     assignments = ", ".join(f"{key} = ?" for key in fields)
 
     with transaction(conn):
-        conn.execute(
-            f"UPDATE jobs SET {assignments} WHERE job_id = ?",
+        cursor = conn.execute(
+            f"UPDATE jobs SET {assignments} WHERE job_id = ? "
+            "AND status IN ('queued', 'running', 'cancelling', 'finalizing') "
+            "AND cancel_requested_at IS NULL",
             [*fields.values(), job_id],
+        )
+    return cursor.rowcount > 0
+
+
+def finish_job(job_id: str, status: str, conn=None, **fields: Any) -> bool:
+    """Publish a terminal outcome once; late workers cannot overwrite it."""
+    if status not in TERMINAL:
+        raise ValueError(f"Invalid terminal job status: {status}")
+    conn = conn or get_conn()
+    fields.setdefault("finished_at", _now())
+    fields.setdefault("cleanup_status", "unconfirmed")
+    fields.setdefault("pass_name", None)
+    if "result" in fields:
+        fields["result_json"] = json.dumps(fields.pop("result"), ensure_ascii=False)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    empty_result = ", result_json = COALESCE(result_json, '{}')" if "result_json" not in fields else ""
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE jobs SET status = CASE WHEN cancel_requested_at IS NOT NULL "
+            "THEN 'cancelled' ELSE ? END, " + assignments + empty_result + " "
+            "WHERE job_id = ? AND status IN ('queued', 'running', 'cancelling', 'finalizing')",
+            [status, *fields.values(), job_id],
+        )
+    return cursor.rowcount > 0
+
+
+def request_cancel(job_id: str, cancel_pid: int, cancel_owner_started: str, conn=None) -> bool:
+    conn = conn or get_conn()
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE jobs SET status = 'cancelling', cancel_requested_at = ?, "
+            "cancel_pid = ?, cancel_owner_started = ? WHERE job_id = ? "
+            "AND status IN ('queued', 'running', 'finalizing') AND cancel_requested_at IS NULL",
+            (_now(), cancel_pid, cancel_owner_started, job_id),
+        )
+    return cursor.rowcount > 0
+
+
+def reconcile(conn=None) -> None:
+    """Recover only proven orphans. Reads and runtime startup share this path.
+
+    The cancellation coordinator owns external cleanup after killing the worker.
+    If both processes disappear, preserve data and mark cleanup unconfirmed;
+    recovery never unloads a shared model or resumes ingestion implicitly.
+    """
+    conn = conn or get_conn()
+    # Serialize the snapshot with cancel intent and terminal publication. A
+    # concurrent controller must not be mistaken for an abandoned cancellation.
+    with transaction(conn, immediate=True):
+        _reconcile_locked(conn)
+
+
+def _reconcile_locked(conn) -> None:
+    rows = conn.execute("SELECT * FROM jobs WHERE status IN "
+                        "('queued', 'running', 'cancelling', 'finalizing')").fetchall()
+    for row in rows:
+        if processes.alive(row["pid"], row["owner_started"]):
+            continue
+        if row["cancel_requested_at"] and processes.alive(row["cancel_pid"], row["cancel_owner_started"]):
+            continue
+        finish_job(
+            row["job_id"], "cancelled" if row["cancel_requested_at"] else "failed", conn=conn,
+            error="Processo terminou sem concluir o job; dados já gravados foram preservados",
+            cleanup_status="unconfirmed",
+            cleanup_error="Processo encerrado; limpeza de recursos externos não confirmada",
         )
 
 
 def get_job(job_id: str, conn=None) -> dict[str, Any] | None:
     conn = conn or get_conn()
+    reconcile(conn)
     row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
     if not row:
         return None
 
-    job = _decode_job(row)
-    job["running"] = job["status"] == "running" and _pid_alive(job.get("pid"))
-
-    # Um job "running" cujo processo sumiu morreu sem conseguir se marcar.
-    if job["status"] == "running" and not job["running"]:
-        update_job(
-            job_id,
-            status="failed",
-            error="processo terminou sem reportar conclusão",
-            finished_at=_now(),
-            conn=conn,
-        )
-        job["status"] = "failed"
-        job["error"] = "processo terminou sem reportar conclusão"
-
-    return job
+    return _decode_job(row)
 
 
 def active_jobs(
@@ -122,19 +181,16 @@ def active_jobs(
     embedados — e o agente não teria como perceber.
     """
     conn = conn or get_conn()
+    reconcile(conn)
 
     rows = conn.execute(
-        "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at"
+        "SELECT * FROM jobs WHERE status IN ('queued', 'running', 'cancelling', 'finalizing') ORDER BY created_at"
     ).fetchall()
 
     active: list[dict[str, Any]] = []
 
     for row in rows:
-        job = dict(row)
-
-        # Um job cujo processo sumiu não está mais em andamento.
-        if job["status"] == "running" and not _pid_alive(job.get("pid")):
-            continue
+        job = _decode_job(row)
 
         if collection_ids and job["collection_id"] not in collection_ids:
             continue
@@ -146,6 +202,7 @@ def active_jobs(
 
 def list_jobs(limit: int = 10, conn=None, offset: int = 0) -> list[dict[str, Any]]:
     conn = conn or get_conn()
+    reconcile(conn)
     rows = conn.execute(
         "SELECT * FROM jobs ORDER BY created_at DESC, job_id DESC LIMIT ? OFFSET ?",
         (limit, offset),
@@ -159,8 +216,10 @@ def _decode_job(row, compact: bool = False) -> dict:
     raw = job.pop("result_json", None)
     result = json.loads(raw) if raw else None
     if compact and result:
-        result = {key: len(result.get(key, [])) for key in ("indexed", "skipped", "failed")}
+        result = {key: len(result.get(key, [])) for key in
+                  ("indexed", "skipped", "failed", "pending", "pending_inputs")}
     job["result"] = result
+    job["running"] = job["status"] in ACTIVE
     return job
 
 
@@ -169,27 +228,11 @@ def result_status(result: dict) -> str:
     if not available:
         return "failed"
     enrichment = result.get("enrichment", {})
-    if (result.get("failed") or enrichment.get("failed") or enrichment.get("skipped") or
+    if (result.get("failed") or result.get("pending") or enrichment.get("failed") or enrichment.get("skipped") or
             any(item.get("quality", {}).get("status") == "partial" for item in available)):
         return "partial"
     return "done"
 
 
 def _pid_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-
-    try:
-        if sys.platform == "win32":
-            import ctypes
-
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-            if not handle:
-                return False
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
-
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    return processes.alive(pid, None)
