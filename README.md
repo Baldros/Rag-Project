@@ -30,15 +30,15 @@ reranking são baixados no primeiro `on` correspondente.
 
 ## Sessões e recursos
 
-Modelos só carregam após o comando manual `on` ou durante um job iniciado nessa
-sessão. Há **uma sessão local por vez**:
+Modelos só carregam após o comando manual `on` e só saem com `off` ou `switch`.
+Há **uma sessão local por vez**:
 
 ```powershell
 python -m kb.cli on --mode interaction  # carrega embedding e reranker
 python -m kb.cli search "campo elétrico" --collection fisica-3
 python -m kb.cli off                    # libera os modelos e encerra a sessão
 
-python -m kb.cli on --mode ingestion    # prepara o parser
+python -m kb.cli on --mode ingestion    # carrega parser, tokenizer e embedding
 python -m kb.cli ingest "E:/Estudo/Fisica" --collection fisica-3
 python -m kb.cli off
 ```
@@ -49,11 +49,21 @@ errado ou com a sessão desligada devolve erro JSON com instrução para ligar o
 trocar de modo. `on` no modo já ativo é idempotente. A comunicação com o processo
 local é privada e autenticada; não há servidor de rede público.
 
-Uma ingestão executa parse, embedding e enriquecimento em sequência, liberando
-um modelo antes de carregar o próximo. A limpeza do job termina antes de publicar
-o estado terminal. O parser é preparado novamente quando uma nova ingestão
-precisa dele, sem recarga incondicional ao terminar. A sessão permanece no modo
-escolhido; não há troca automática, desligamento automático ou prazo de inatividade.
+`on` e `switch` não têm prazo: a ativação termina quando o processo responde,
+quando morre ou quando `off` a cancela (`START_CANCELLED`). Em disco lento ela pode
+levar vários minutos. Cada tentativa grava suas etapas em
+`store/startup/<id>.jsonl`, e `session` devolve `starting` com esse id enquanto ela
+estiver em andamento. Uma instalação quebrada aparece aqui, como `START_FAILED`
+com a etapa e o erro. Avisos que não impedem o uso, como Ollama fora do ar, ficam no
+mesmo arquivo. As últimas 20 tentativas são mantidas.
+
+Uma ingestão executa parse, embedding e enriquecimento em sequência, sobre os
+modelos que a ativação carregou. O job não os descarrega: **liberar a GPU exige
+`off`**. A exceção é o modelo de resumos, que roda no Ollama, entra só no passe de
+enriquecimento e sai ao fim dele. Um lote com OCR diferente do carregado recria o
+parser. A limpeza do job termina antes de publicar o estado terminal. A sessão
+permanece no modo escolhido; não há troca automática, desligamento automático ou
+prazo de inatividade.
 Em `interaction`, embedding e reranker continuam carregados entre perguntas,
 até `off` ou `switch` explícito. `ingest` espera o resultado por padrão;
 `--background` devolve um `job_id` e o processo continua independente do cliente.
