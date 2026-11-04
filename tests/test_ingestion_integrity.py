@@ -180,8 +180,7 @@ class PersistenceTests(unittest.TestCase):
         with patch.object(pipeline, "expand_paths", return_value=[Path("new.pdf")]), \
              patch.object(pipeline, "file_sha256", return_value="doc"), \
              patch.object(pipeline, "get_pdf_page_count", return_value=2), \
-             patch.object(pipeline, "parse_document", side_effect=RuntimeError("bad PDF")), \
-             patch.object(pipeline, "release_converter"):
+             patch.object(pipeline, "parse_document", side_effect=RuntimeError("bad PDF")):
             result = pipeline.ingest_paths(["new.pdf"], conn=self.conn)
         self.assertEqual(len(result["failed"]), 1)
         row = self.conn.execute("SELECT * FROM documents").fetchone()
@@ -216,7 +215,6 @@ class PersistenceTests(unittest.TestCase):
              patch.object(pipeline, "parse_document", return_value=manifest), \
              patch.object(pipeline, "segment_document", return_value=([section], [chunk])), \
              patch.object(pipeline, "export_markdown"), patch.object(pipeline, "activate_manifest"), \
-             patch.object(pipeline, "release_converter"), \
              patch.object(pipeline, "embed_pending", side_effect=RuntimeError("GPU failed")):
             result = pipeline.ingest_paths(["new.pdf"], conn=self.conn, enrich=False)
         self.assertEqual(result["indexed"], [])
@@ -273,8 +271,7 @@ class PersistenceTests(unittest.TestCase):
         with patch.object(pipeline, "expand_paths", return_value=[Path("same.pdf")]), \
              patch.object(pipeline, "file_sha256", return_value="doc"), \
              patch.object(pipeline, "get_pdf_page_count", return_value=2), \
-             patch.object(pipeline, "parse_document", side_effect=RuntimeError("retry failed")) as parse_pdf, \
-             patch.object(pipeline, "release_converter"), patch.object(pipeline, "release_chunker"):
+             patch.object(pipeline, "parse_document", side_effect=RuntimeError("retry failed")) as parse_pdf:
             result = pipeline.ingest_paths(["same.pdf"], conn=self.conn)
         self.assertFalse(parse_pdf.call_args.kwargs["force"])
         self.assertEqual(result["failed"][0]["phase"], "parse")
@@ -306,7 +303,6 @@ class PersistenceTests(unittest.TestCase):
              patch.object(pipeline, "file_sha256", return_value="doc"), \
              patch.object(pipeline, "is_indexed", return_value=True), \
              patch.object(pipeline, "embed_pending", return_value=0), \
-             patch.object(pipeline, "release_converter"), patch.object(pipeline, "release_chunker"), \
              patch.object(enrich, "run_pass", side_effect=enrichment):
             result = pipeline.ingest_paths(["same.pdf"], conn=self.conn, on_checkpoint=checkpoint)
         self.assertEqual(jobs.result_status(result), "partial")

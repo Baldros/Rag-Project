@@ -193,15 +193,27 @@ class WorkerTests(JobFixture):
             self.assertFalse(jobs.active_jobs())
             self.assertTrue(all(j["status"] == "failed" for j in jobs.list_jobs()))
 
-    def test_cleanup_attempts_every_resource_even_if_one_raises(self):
-        with patch.object(parse, "release_converter", side_effect=RuntimeError("parser")), \
+    def test_job_end_keeps_session_models_and_only_releases_generation(self):
+        with patch.object(parse, "release_converter") as parser, \
              patch.object(segment, "release_chunker") as chunker, \
-             patch.object(models, "unload_all") as model_cleanup, \
+             patch.object(models, "unload_all") as embedder, \
              patch.object(llm, "unload", return_value=False) as generation:
             errors = runtime.Runtime("ingestion", "test")._cleanup_job()
-        self.assertEqual(len(errors), 2)
+        self.assertEqual(errors, ["generation: descarga não confirmada"])
+        parser.assert_not_called()
+        chunker.assert_not_called()
+        embedder.assert_not_called()
+        generation.assert_called_once()
+
+    def test_turning_the_session_off_releases_every_model(self):
+        with patch.object(parse, "release_converter") as parser, \
+             patch.object(segment, "release_chunker") as chunker, \
+             patch.object(models, "unload_all") as embedder, \
+             patch.object(llm, "unload") as generation:
+            runtime.Runtime("ingestion", "test").close()
+        parser.assert_called_once()
         chunker.assert_called_once()
-        model_cleanup.assert_called_once()
+        embedder.assert_called_once()
         generation.assert_called_once()
 
     def test_cancel_is_persisted_before_runtime_stops_admitting_work(self):
@@ -268,12 +280,12 @@ class WorkerTests(JobFixture):
         worker = self.worker()
         job_id = worker.job_id
 
-        def embed_batches(doc_ids, on_progress):
+        def embed_batches(doc_ids, on_progress, unload_when_done):
+            self.assertFalse(unload_when_done)
             on_progress(12, 20, "saved first batch")
             raise RuntimeError("second batch failed")
 
-        with patch.object(worker, "_release_ingestion"), \
-             patch.object(worker, "_cleanup_job", return_value=[]), \
+        with patch.object(worker, "_cleanup_job", return_value=[]), \
              patch.object(embed, "embed_pending", side_effect=embed_batches):
             worker._run_job(job_id, "reindex", {})
         job = jobs.get_job(job_id)
