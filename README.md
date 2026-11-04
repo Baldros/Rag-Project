@@ -106,6 +106,25 @@ versão anterior publicada e deixa um checkpoint para retomada. A geração usad
 pelo documento é registrada no SQLite junto com os novos chunks. Limpeza de
 vetores antigos fica marcada no banco até terminar, antes dos novos embeddings.
 
+### Corrigir uma fórmula à mão
+
+`kb formulas apply --doc-id ID --file correcoes.json` aplica LaTeX escrito por uma
+pessoa, em modo de ingestão e sem job em andamento. O arquivo é uma lista de
+objetos com `ref`, `page`, `expected` (o LaTeX que a pessoa estava vendo) e `text`;
+`text: null` restaura o que o modelo escreveu. Uma fórmula que mudou desde a edição
+é recusada e listada em `rejected`, e o job termina como `partial`.
+
+As correções ficam no manifest (`corrections`), sem alterar o JSON do bloco, que
+guarda o que o modelo escreveu. A aplicação publica uma nova geração junto com os
+novos chunks e refaz os vetores do documento. Uma nova conversão, mesmo com
+`--force`, reaplica as correções. Se a fórmula não estiver mais no mesmo lugar, a
+correção não é aplicada e vira um problema de qualidade, com o texto preservado. A
+fórmula corrigida deixa de ser sinalizada e entra em `formula_corrected`.
+
+O resumo do documento é mantido, porque lê só o sumário e os seis primeiros chunks.
+`summary_affected` diz se a correção mudou esse trecho, e `kb summarize --doc-id ID`
+refaz o resumo. O anterior só é substituído quando o novo é gerado.
+
 Conversão, fórmulas e segmentação têm assinaturas separadas. Alterar o tamanho
 de chunk reutiliza o parse; mudar a configuração de fórmulas reutiliza o layout
 compatível. O chunker recebe o documento concatenado para preservar os títulos
@@ -168,7 +187,7 @@ importam PyTorch.
 |---|---|
 | Sessão | `on`, `off`, `switch`, `session` |
 | Recuperação | `search`, `fetch`, `outline` |
-| Ingestão | `ingest`, `reindex`, `jobs list/show/cancel` |
+| Ingestão | `ingest`, `reindex`, `formulas apply`, `summarize`, `jobs list/show/cancel` |
 | Catálogo | `collections list/show/create/update/delete/add-docs/remove-docs`, `documents list/show/delete` |
 | Diagnóstico | `status`, `doctor`, `models` |
 
