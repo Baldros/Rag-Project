@@ -228,8 +228,8 @@ def build_parser() -> JsonParser:
     sub = parser.add_subparsers(dest="command", required=True, parser_class=JsonParser)
     p = sub.add_parser("on", help="liga sessão e carrega modelos")
     p.add_argument("--mode", choices=["interaction", "ingestion"], required=True,
-                   help="interaction carrega embedding e reranker; ingestion, o parser")
-    p = sub.add_parser("off", help="desliga sessão e libera recursos")
+                   help="interaction carrega embedding e reranker; ingestion, parser e embedding")
+    p = sub.add_parser("off", help="desliga sessão e libera recursos; durante a ativação, cancela")
     p.add_argument("--cancel", action="store_true",
                    help="cancela o job ativo em vez de aguardá-lo")
     waiting = p.add_mutually_exclusive_group()

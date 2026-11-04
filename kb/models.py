@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -35,9 +36,10 @@ def free_vram() -> None:
     gc.collect()
 
     try:
-        import torch
+        # A process that never imported torch has nothing to return to the driver.
+        torch = sys.modules.get("torch")
 
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
     except Exception:  # pragma: no cover

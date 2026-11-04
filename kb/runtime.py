@@ -12,6 +12,7 @@ from typing import Any
 
 from kb.db import init_db
 from kb.session import MODES, SessionError
+from kb.startup_log import StartupLog
 
 
 def _now() -> str:
@@ -23,9 +24,10 @@ class _JobCancelled(BaseException):
 
 
 class Runtime:
-    def __init__(self, mode: str, nonce: str) -> None:
+    def __init__(self, mode: str, nonce: str, startup: StartupLog | None = None) -> None:
         self.mode = mode
         self.nonce = nonce
+        self.startup = startup or StartupLog(None, "runtime")
         self.running = True
         self.job_id: str | None = None
         self.job_thread: threading.Thread | None = None
@@ -34,33 +36,76 @@ class Runtime:
         self._cancelling = False
 
     def prepare(self) -> None:
-        from kb.providers import validate_config
+        """Activation: everything a mode needs, loaded once, until the user turns it off."""
+        with self.startup.stage("validate_config"):
+            from kb.providers import validate_config
 
-        validate_config()
-        from kb.jobs import reconcile
+            validate_config()
+        with self.startup.stage("database"):
+            from kb.jobs import reconcile
 
-        conn = init_db()
-        try:
-            reconcile(conn)
-        finally:
-            conn.close()
+            conn = init_db()
+            try:
+                reconcile(conn)
+            finally:
+                conn.close()
         if self.mode == "interaction":
-            from kb.config import RERANK_ENABLED
-            from kb.models import preload
-            from kb.vectors import get_index
-
-            get_index()  # Refuse an incompatible embedding before loading GPU models.
-            preload(rerank=RERANK_ENABLED)
+            self._prepare_interaction()
         else:
             self._prepare_ingestion()
 
-    @staticmethod
-    def _prepare_ingestion() -> None:
-        from kb.ingest.parse import get_converter
-        from kb.ingest.segment import get_chunker
+    def _prepare_interaction(self) -> None:
+        with self.startup.stage("vector_index"):
+            from kb.vectors import get_index
 
-        get_converter()
-        get_chunker()
+            get_index()  # Refuse an incompatible embedding before loading GPU models.
+        with self.startup.stage("models_load"):
+            from kb.config import RERANK_ENABLED
+            from kb.models import preload
+
+            preload(rerank=RERANK_ENABLED)
+
+    def _prepare_ingestion(self) -> None:
+        # Imports are separate stages because they are the slow part on a cold
+        # disk, and the first place a broken installation shows up.
+        with self.startup.stage("vector_index"):
+            from kb.config import EMBED_ID
+            from kb.vectors import get_index
+
+            # A mismatch is what `reindex --reset` repairs, so it cannot refuse activation.
+            identity = get_index(allow_mismatch=True).embedding_identity()
+            if identity != EMBED_ID:
+                self.startup.warning("embedding", f"Índice criado com {identity!r}, configuração atual "
+                                                  f"{EMBED_ID!r}. Execute a reindexação com reset.")
+        with self.startup.stage("parser_import"):
+            import docling.document_converter  # noqa: F401
+            from docling.datamodel.base_models import InputFormat
+            from kb.ingest.parse import get_converter
+        with self.startup.stage("parser_load"):
+            get_converter().initialize_pipeline(InputFormat.PDF)
+        with self.startup.stage("chunker_import"):
+            import docling.chunking  # noqa: F401
+            from kb.ingest.segment import get_chunker
+        with self.startup.stage("tokenizer_load"):
+            get_chunker()
+        with self.startup.stage("embedder_load"):
+            from kb.models import EMBEDDER
+
+            EMBEDDER.load()
+        with self.startup.stage("checks"):
+            self._report_checks()
+
+    def _report_checks(self) -> None:
+        """Irregularities that do not stop the session, visible from the start."""
+        import torch
+        from kb import llm
+        from kb.config import DEVICE, LLM_ENABLED, LLM_MODEL, OLLAMA_URL
+
+        if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+            self.startup.warning("gpu", "KB_DEVICE pede CUDA, mas ele não está disponível: a conversão vai para a CPU.")
+        if LLM_ENABLED and not llm.is_available():
+            self.startup.warning("ollama", f"Ollama ou o modelo {LLM_MODEL} indisponível em {OLLAMA_URL}: "
+                                           "os resumos ficarão pendentes.")
 
     @staticmethod
     def _release_ingestion() -> None:
@@ -108,7 +153,6 @@ class Runtime:
                     on_checkpoint=lambda snapshot: update_job(job_id, result=snapshot),
                 )
             else:
-                self._release_ingestion()
                 from kb.collection import resolve_scope
                 from kb.ingest.embed import embed_pending, reset_embeddings
                 from kb.models import EMBEDDER
@@ -129,7 +173,8 @@ class Runtime:
                     update_job(job_id, result=result)
                     progress("embed", done, total, message)
 
-                result["embedded"] = embed_pending(doc_ids=doc_ids, on_progress=reindex_progress)
+                result["embedded"] = embed_pending(doc_ids=doc_ids, on_progress=reindex_progress,
+                                                   unload_when_done=False)
             status = result_status(result) if action == "ingest" else "done"
             if status == "failed":
                 error = "Ingestão incompleta; consulte result"
@@ -159,19 +204,18 @@ class Runtime:
                 os._exit(1)
 
     def _cleanup_job(self) -> list[str]:
-        from kb.ingest.parse import release_converter
-        from kb.ingest.segment import release_chunker
-        from kb.models import unload_all
+        """Parser, chunker and embedder stay loaded until the user turns the session off."""
         from kb import llm
+        from kb.models import free_vram
 
         errors = []
-        for name, release in (("parser", release_converter), ("chunker", release_chunker),
-                              ("models", unload_all), ("generation", llm.unload)):
-            try:
-                if release() is False:
-                    errors.append(f"{name}: descarga não confirmada")
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
+        try:
+            # The generation model belongs to Ollama and only enters for the summary pass.
+            if llm.unload() is False:
+                errors.append("generation: descarga não confirmada")
+        except Exception as exc:
+            errors.append(f"generation: {exc}")
+        free_vram()
         return errors
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -257,7 +301,9 @@ class Runtime:
         else:
             self._release_ingestion()
             from kb import llm
+            from kb.models import unload_all
 
+            unload_all()
             llm.unload()
 
 
@@ -266,18 +312,24 @@ def main() -> None:
     parser.add_argument("--mode", required=True, choices=sorted(MODES))
     parser.add_argument("--address", required=True)
     parser.add_argument("--nonce", required=True)
+    parser.add_argument("--startup-id")
     args = parser.parse_args()
     key = os.environ.pop("KB_SESSION_AUTHKEY", None)
     if not key:
         raise RuntimeError("Chave de sessão ausente")
-    runtime = Runtime(args.mode, args.nonce)
+    startup = StartupLog(args.startup_id, "runtime")
+    startup.emit("stage.finished", stage="process_start", pid=os.getpid())
+    runtime = Runtime(args.mode, args.nonce, startup)
     try:
         runtime.prepare()
-        with Listener(
-            args.address,
-            family="AF_PIPE" if os.name == "nt" else "AF_UNIX",
-            authkey=bytes.fromhex(key),
-        ) as listener:
+        with startup.stage("listener_bind"):
+            server = Listener(
+                args.address,
+                family="AF_PIPE" if os.name == "nt" else "AF_UNIX",
+                authkey=bytes.fromhex(key),
+            )
+        with server as listener:
+            startup.emit("ready", pid=os.getpid())
             while runtime.running:
                 with listener.accept() as connection:
                     try:

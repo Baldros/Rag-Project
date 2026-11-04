@@ -1,13 +1,12 @@
 """
 Orquestração da ingestão.
 
-Os dois passes rodam em sequência, nunca sobrepostos, porque cada um carrega o
-seu próprio modelo na GPU:
+Os passes rodam em sequência, sobre os modelos que a ativação da sessão deixou
+carregados; quem os descarrega é o usuário, ao desligar a sessão:
 
     Pass 1  PARSE + SEGMENT   Docling  → artifacts/ e SQLite
-            (descarrega)
     Pass 2  EMBED             bge-m3   → índice vetorial
-            (descarrega)
+    Pass 3  RESUMOS           Ollama   → entra e sai só neste passe
 
 Entre eles a comunicação é por disco. É isso que torna o processo retomável: um
 kill no meio do Pass 2 não perde o Pass 1, e trocar de modelo de embedding não
@@ -33,14 +32,12 @@ from kb.ingest.parse import (
     export_markdown,
     is_parsed,
     parse_document,
-    release_converter,
     read_manifest,
     activate_manifest,
 )
 from kb.ingest.segment import (
     ChunkRecord,
     SectionRecord,
-    release_chunker,
     segment_document,
     summarize,
 )
@@ -198,8 +195,8 @@ def ingest_paths(
     """
     Executa a ingestão completa e devolve o resumo do que aconteceu.
 
-    Três passes sequenciais, um modelo por vez na GPU — Docling, depois o
-    embedder, depois o LLM. Cada um descarrega antes do próximo.
+    Três passes sequenciais: Docling, embedder e LLM. Os dois primeiros ficam
+    carregados até o usuário desligar a sessão; o LLM sai ao fim do seu passe.
 
     O processo de sessão de ingestão chama esta função após ativação manual.
     """
@@ -240,82 +237,75 @@ def ingest_paths(
     checkpoint()
 
     # ---------- Pass 1: Docling ----------
-    try:
-        for index, pdf_path in enumerate(files, start=1):
-            progress("parse", index - 1, len(files), pdf_path.name)
-            doc_id = None
-            try:
-                doc_id = file_sha256(pdf_path)
-                prior = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
-                if not force and is_indexed(doc_id, conn, ocr):
-                    with transaction(conn):
-                        conn.execute("UPDATE documents SET filename = ?, source_path = ? WHERE doc_id = ?",
-                                     (pdf_path.name, str(pdf_path), doc_id))
-                    result["skipped"].append({"doc_id": doc_id, "filename": pdf_path.name,
-                                              "quality": decode_quality(prior["quality_json"])})
-                    touched.append(doc_id)
-                    _associate(collection_id, doc_id, conn)
-                    continue
-                register_document(
-                    doc_id, pdf_path, get_pdf_page_count(pdf_path), conn=conn
-                )
-
-                manifest = parse_document(
-                    pdf_path,
-                    doc_id,
-                    on_progress=lambda done, total, msg: (
-                        on_progress("parse", done, total, msg) if on_progress else None
-                    ),
-                    force=force,
-                    ocr=ocr,
-                    previous=read_manifest(doc_id, prior["artifact_manifest"]) if prior else None,
-                )
-
-                sections, chunks = segment_document(doc_id, manifest)
-
-                if not chunks:
-                    raise RuntimeError("parse não produziu nenhum chunk")
-
-                export_markdown(doc_id, manifest)
-                # The artifact and its chunks become visible in one transaction.
+    for index, pdf_path in enumerate(files, start=1):
+        progress("parse", index - 1, len(files), pdf_path.name)
+        doc_id = None
+        try:
+            doc_id = file_sha256(pdf_path)
+            prior = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+            if not force and is_indexed(doc_id, conn, ocr):
                 with transaction(conn):
-                    persist_segments(doc_id, sections, chunks, conn=conn, manifest=manifest)
-                    _associate(collection_id, doc_id, conn)
-                try:
-                    activate_manifest(doc_id, manifest)
-                except OSError:
-                    logger.exception("Não foi possível atualizar o atalho do manifest; a geração está no SQLite")
-
-                stats = summarize(sections, chunks)
-                result["n_sections"] += stats["n_sections"]
-                result["n_chunks"] += stats["n_chunks"]
-                prepared.append(
-                    {"doc_id": doc_id, "filename": pdf_path.name, **stats,
-                     "quality": manifest["quality"], "manifest": manifest["manifest_file"]}
-                )
+                    conn.execute("UPDATE documents SET filename = ?, source_path = ? WHERE doc_id = ?",
+                                 (pdf_path.name, str(pdf_path), doc_id))
+                result["skipped"].append({"doc_id": doc_id, "filename": pdf_path.name,
+                                          "quality": decode_quality(prior["quality_json"])})
                 touched.append(doc_id)
+                _associate(collection_id, doc_id, conn)
+                continue
+            register_document(
+                doc_id, pdf_path, get_pdf_page_count(pdf_path), conn=conn
+            )
 
-            except Exception as exc:
-                logger.exception("Falha ingerindo %s", pdf_path.name)
-                if doc_id:
-                    _mark_failed(doc_id, str(exc), conn)
-                result["failed"].append(
-                    {"doc_id": doc_id, "filename": pdf_path.name, "phase": "parse",
-                     "error": str(exc), **({"manifest": exc.manifest} if hasattr(exc, "manifest") else {})}
-                )
-            finally:
-                result["pending_inputs"].remove(str(pdf_path))
-                checkpoint()
-    finally:
-        # Libera a GPU antes do Pass 2: a regra é um modelo por vez.
-        release_converter()
-        release_chunker()
+            manifest = parse_document(
+                pdf_path,
+                doc_id,
+                on_progress=lambda done, total, msg: (
+                    on_progress("parse", done, total, msg) if on_progress else None
+                ),
+                force=force,
+                ocr=ocr,
+                previous=read_manifest(doc_id, prior["artifact_manifest"]) if prior else None,
+            )
+
+            sections, chunks = segment_document(doc_id, manifest)
+
+            if not chunks:
+                raise RuntimeError("parse não produziu nenhum chunk")
+
+            export_markdown(doc_id, manifest)
+            # The artifact and its chunks become visible in one transaction.
+            with transaction(conn):
+                persist_segments(doc_id, sections, chunks, conn=conn, manifest=manifest)
+                _associate(collection_id, doc_id, conn)
+            try:
+                activate_manifest(doc_id, manifest)
+            except OSError:
+                logger.exception("Não foi possível atualizar o atalho do manifest; a geração está no SQLite")
+
+            stats = summarize(sections, chunks)
+            result["n_sections"] += stats["n_sections"]
+            result["n_chunks"] += stats["n_chunks"]
+            prepared.append(
+                {"doc_id": doc_id, "filename": pdf_path.name, **stats,
+                 "quality": manifest["quality"], "manifest": manifest["manifest_file"]}
+            )
+            touched.append(doc_id)
+
+        except Exception as exc:
+            logger.exception("Falha ingerindo %s", pdf_path.name)
+            if doc_id:
+                _mark_failed(doc_id, str(exc), conn)
+            result["failed"].append(
+                {"doc_id": doc_id, "filename": pdf_path.name, "phase": "parse",
+                 "error": str(exc), **({"manifest": exc.manifest} if hasattr(exc, "manifest") else {})}
+            )
+        finally:
+            result["pending_inputs"].remove(str(pdf_path))
+            checkpoint()
     result["timings"]["parse_segment"] = round(time.monotonic() - started, 3)
     checkpoint()
 
     # ---------- Pass 2: bge-m3 ----------
-    # `embed_pending` descarrega o embedder ao terminar, liberando a GPU para o
-    # LLM do Pass 3.
     if touched:
         embed_started = time.monotonic()
         embed_error = None
@@ -324,7 +314,7 @@ def ingest_paths(
                 doc_ids=touched,
                 on_progress=lambda done, total, msg: (
                     progress("embed", done, total, msg)
-                ), conn=conn,
+                ), conn=conn, unload_when_done=False,
             )
         except Exception as exc:
             embed_error = str(exc)

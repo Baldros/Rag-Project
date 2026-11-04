@@ -18,7 +18,9 @@ from multiprocessing.connection import Client
 from pathlib import Path
 from typing import Any, Iterator
 
+from kb import startup_log
 from kb.config import PROJECT_ROOT, STORE_DIR
+from kb.startup_log import StartupLog
 
 STATE_PATH = STORE_DIR / "session.json"
 LOCK_PATH = STORE_DIR / "session.lock"
@@ -37,9 +39,8 @@ class SessionError(RuntimeError):
 def _locked() -> Iterator[None]:
     STORE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a+b") as file:
-        file.seek(0)
-        if file.read(1) == b"":
-            file.seek(0)
+        # Reading the file would fail on Windows while another client holds the byte lock.
+        if os.fstat(file.fileno()).st_size == 0:
             file.write(b"0")
             file.flush()
         file.seek(0)
@@ -113,10 +114,24 @@ def _probe(state: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
 
 
+def _starting(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """An activation still in progress: spawned, not yet answering, process alive."""
+    if not state or "owner_started" in state or not state.get("startup_id"):
+        return None
+    from kb import processes
+
+    if not processes.alive(state.get("pid"), state.get("spawn_started")):
+        return None
+    return {"mode": state.get("mode"), "startup_id": state["startup_id"]}
+
+
 def status() -> dict[str, Any]:
     state = _read_state()
     live = _probe(state)
-    return {"active": bool(live), **(live or {})}
+    if live:
+        return {"active": True, **live}
+    starting = _starting(state)
+    return {"active": False, **({"starting": starting} if starting else {})}
 
 
 def call(mode: str, action: str, **payload: Any) -> dict[str, Any]:
@@ -149,6 +164,13 @@ def _address() -> str:
     return str(STORE_DIR / f"session-{suffix}.sock")
 
 
+def _runtime_command(state: dict[str, Any], mode: str) -> list[str]:
+    return [
+        sys.executable, "-m", "kb.runtime", "--mode", mode, "--address", state["address"],
+        "--nonce", state["nonce"], "--startup-id", state["startup_id"],
+    ]
+
+
 def _start_locked(mode: str) -> dict[str, Any]:
     if mode not in MODES:
         raise SessionError("INVALID_MODE", f"Modo inválido: {mode}")
@@ -163,19 +185,27 @@ def _start_locked(mode: str) -> dict[str, Any]:
             f"Execute `kb switch --mode {mode}`",
         )
     if old:
+        if _starting(old):
+            raise SessionError("SESSION_STARTING", f"Já há uma ativação de {old.get('mode')} em andamento",
+                               "Aguarde terminar ou desligue para cancelar")
         _require_dead(old)
         STATE_PATH.unlink(missing_ok=True)
 
+    from kb import processes
+
+    startup_id = startup_log.new_id()
+    startup_log.prune()
+    attempt = StartupLog(startup_id, "session")
     state = {
         "mode": mode,
         "address": _address(),
         "authkey": secrets.token_hex(32),
         "nonce": secrets.token_hex(16),
+        "startup_id": startup_id,
     }
-    command = [
-        sys.executable, "-m", "kb.runtime", "--mode", mode,
-        "--address", state["address"], "--nonce", state["nonce"],
-    ]
+    command = _runtime_command(state, mode)
+    attempt.emit("plan", mode=mode, stages=list(startup_log.STAGES[mode]))
+    attempt.emit("stage.started", stage="process_start")
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with LOG_PATH.open("a", encoding="utf-8") as log:
         process = subprocess.Popen(
@@ -186,30 +216,35 @@ def _start_locked(mode: str) -> dict[str, Any]:
             stderr=log,
             creationflags=flags,
             start_new_session=os.name != "nt",
-            env={**os.environ, "KB_SESSION_AUTHKEY": state["authkey"]},
+            # Unbuffered so a client following the log sees the activation as it happens.
+            env={**os.environ, "KB_SESSION_AUTHKEY": state["authkey"], "PYTHONUNBUFFERED": "1"},
         )
     state["pid"] = process.pid
+    state["spawn_started"] = processes.identity(process.pid)
     _write_state(state)
-    deadline = time.monotonic() + 300
+    # No deadline: loading is slow on this machine and that is expected. It ends
+    # when the runtime answers, when it dies, or when the user cancels with `off`.
     try:
-        while time.monotonic() < deadline:
+        while True:
             live = _probe(state)
             if live:
-                from kb import processes
-
                 state["pid"] = live["pid"]
                 state["owner_started"] = processes.identity(live["pid"])
                 _write_state(state)
                 return live
             if process.poll() is not None:
-                detail = _last_log_error()
+                detail = startup_log.failure_summary(startup_id) or _last_log_error()
+                attempt.emit("failed", exit_code=process.returncode, detail=detail)
                 raise SessionError(
                     "START_FAILED", f"Falha ao iniciar o modo {mode}",
                     detail or f"Consulte {LOG_PATH}",
                 )
+            if startup_log.cancel_requested(startup_id):
+                attempt.emit("cancelled")
+                raise SessionError("START_CANCELLED", f"Ativação do modo {mode} cancelada")
             time.sleep(0.5)
-        raise SessionError("START_TIMEOUT", f"Tempo esgotado ao iniciar {mode}")
     except BaseException:
+        startup_log.clear_cancel(startup_id)
         if process.poll() is None:
             process.terminate()
             try:
@@ -302,6 +337,38 @@ def _await_exit(pid: int, handle, timeout: float = 60) -> bool:
     return False
 
 
+def _terminate(pid: int, handle) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        terminate = ctypes.windll.kernel32.TerminateProcess
+        terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        terminate(handle, 1)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Runtime may exit itself immediately after acknowledging.
+
+
+def _stop_abandoned_start(state: dict[str, Any]) -> dict[str, Any]:
+    """Holding the lock proves the controller is gone, so nobody else can stop it."""
+    pid = int(state["pid"])
+    try:
+        with _process_target(pid) as handle:
+            _terminate(pid, handle)
+            if not _await_exit(pid, handle):
+                raise SessionError("STOP_TIMEOUT", "Não consegui encerrar a ativação")
+    except SessionError as exc:
+        if exc.code != "PROCESS_GONE":
+            raise
+    StartupLog(state["startup_id"], "session").emit("cancelled")
+    startup_log.clear_cancel(state["startup_id"])
+    STATE_PATH.unlink(missing_ok=True)
+    return {"active": False, "cancelled_start": True}
+
+
 def _require_dead(state: dict[str, Any]) -> None:
     from kb import processes
 
@@ -315,6 +382,8 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False,
     state = _read_state()
     live = _probe(state)
     if not state or not live:
+        if not expected_job_id and _starting(state):
+            return _stop_abandoned_start(state)
         if state:
             _require_dead(state)
         if expected_job_id:
@@ -350,18 +419,7 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False,
             _request(state, "cancel", job_id=job_id, cancel_pid=cancel_pid,
                      cancel_owner_started=cancel_started)
             # The authenticated pipe proved the identity before opening the handle.
-            if os.name == "nt":
-                import ctypes
-                from ctypes import wintypes
-
-                terminate = ctypes.windll.kernel32.TerminateProcess
-                terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
-                terminate(handle, 1)
-            else:
-                try:
-                    os.kill(runtime_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass  # Runtime may exit itself immediately after acknowledging.
+            _terminate(runtime_pid, handle)
             if not _await_exit(runtime_pid, handle):
                 raise SessionError("STOP_TIMEOUT", "Não consegui encerrar a sessão")
             # Read the persisted phase after exit: it may have changed after ping.
@@ -396,6 +454,10 @@ def _stop_locked(cancel: bool, interactive: bool, fail_if_busy: bool = False,
 
 def stop(cancel: bool = False, interactive: bool = False,
          fail_if_busy: bool = False, expected_job_id: str | None = None) -> dict[str, Any]:
+    # An activation holds the lock for as long as it takes, so ask it to stop first.
+    state = _read_state()
+    if not expected_job_id and _starting(state):
+        startup_log.request_cancel(state["startup_id"])
     with _locked():
         return _stop_locked(cancel, interactive, fail_if_busy, expected_job_id)
 
