@@ -125,7 +125,7 @@ class Runtime:
         }
 
     def _run_job(self, job_id: str, action: str, payload: dict[str, Any]) -> None:
-        from kb.jobs import update_job, result_status, finish_job
+        from kb.jobs import update_job, finish_job
 
         def progress(phase: str, done: int, total: int, message: str) -> None:
             with self._job_lock:
@@ -152,6 +152,17 @@ class Runtime:
                     ocr=payload.get("ocr"),
                     on_checkpoint=lambda snapshot: update_job(job_id, result=snapshot),
                 )
+            elif action == "formulas":
+                from kb.ingest.pipeline import apply_formula_corrections
+
+                result = apply_formula_corrections(payload["doc_id"], payload["changes"], on_progress=progress)
+            elif action == "summary":
+                from kb.enrich import run_pass
+
+                result = {"doc_id": payload["doc_id"], "enrichment": run_pass(
+                    doc_ids=[payload["doc_id"]], regenerate=True,
+                    on_progress=lambda done, total, message: progress("enrich", done, total, message),
+                )}
             else:
                 from kb.collection import resolve_scope
                 from kb.ingest.embed import embed_pending, reset_embeddings
@@ -175,9 +186,10 @@ class Runtime:
 
                 result["embedded"] = embed_pending(doc_ids=doc_ids, on_progress=reindex_progress,
                                                    unload_when_done=False)
-            status = result_status(result) if action == "ingest" else "done"
+            status = _job_status(action, result)
             if status == "failed":
-                error = "Ingestão incompleta; consulte result"
+                error = ((result["enrichment"].get("skipped") or "Resumo não gerado; o resumo anterior foi mantido")
+                         if action == "summary" else "Ingestão incompleta; consulte result")
         except BaseException as exc:
             error = f"{exc}\n{traceback.format_exc()}"[:2000]
         finally:
@@ -254,7 +266,7 @@ class Runtime:
                 expand=payload.get("expand", "section"),
                 use_rerank=payload.get("rerank", True),
             )}
-        if self.mode == "ingestion" and action in {"ingest", "reindex"}:
+        if self.mode == "ingestion" and action in {"ingest", "reindex", "formulas", "summary"}:
             if self.job_id:
                 raise SessionError("BUSY", f"Job {self.job_id} em andamento")
             from kb.jobs import create_job, validate_path
@@ -272,8 +284,7 @@ class Runtime:
                            collection_id=payload["collection"])
             job_id = create_job(
                 kind=action,
-                target="; ".join(payload.get("paths", [])) if action == "ingest"
-                else payload.get("collection") or "toda a base",
+                target=_job_target(action, payload),
                 collection_id=payload.get("collection"),
             )
             self.job_id = job_id
@@ -305,6 +316,31 @@ class Runtime:
 
             unload_all()
             llm.unload()
+
+
+def _job_target(action: str, payload: dict[str, Any]) -> str:
+    if action == "ingest":
+        return "; ".join(payload.get("paths", []))
+    if action == "reindex":
+        return payload.get("collection") or "toda a base"
+    from kb.db import get_conn
+
+    row = get_conn().execute("SELECT filename FROM documents WHERE doc_id = ?", (payload["doc_id"],)).fetchone()
+    if not row:
+        raise ValueError(f"Documento não encontrado: {payload['doc_id']}")
+    return row["filename"]
+
+
+def _job_status(action: str, result: dict[str, Any]) -> str:
+    if action == "ingest":
+        from kb.jobs import result_status
+
+        return result_status(result)
+    if action == "formulas":
+        return "partial" if result.get("rejected") else "done"
+    if action == "summary":
+        return "done" if result["enrichment"].get("documents") else "failed"
+    return "done"
 
 
 def main() -> None:

@@ -75,12 +75,15 @@ def _pending_documents(
     limit: int,
     doc_ids: Sequence[str] | None,
     conn: sqlite3.Connection,
+    regenerate: bool = False,
 ) -> list[sqlite3.Row]:
     sql = """
         SELECT doc_id, filename, title, n_pages, n_sections
           FROM documents
-         WHERE summary IS NULL AND status = 'indexed'
+         WHERE status = 'indexed'
     """
+    if not regenerate:
+        sql += " AND summary IS NULL"
     params: list[Any] = []
 
     if doc_ids:
@@ -133,7 +136,8 @@ def _outline_text(doc_id: str, conn: sqlite3.Connection) -> str:
     ) or "(sem títulos detectados)"
 
 
-def _document_sample(doc_id: str, conn: sqlite3.Connection) -> str:
+def document_sample(doc_id: str, conn: sqlite3.Connection) -> str:
+    """O trecho que o resumo do documento lê, além do sumário."""
     rows = conn.execute(
         "SELECT text FROM chunks WHERE doc_id = ? ORDER BY ord LIMIT 6",
         (doc_id,),
@@ -227,6 +231,7 @@ def run_pass(
     limit: int = 500,
     on_progress: ProgressFn | None = None,
     conn: sqlite3.Connection | None = None,
+    regenerate: bool = False,
 ) -> dict[str, Any]:
     """
     Pass 3 completo: documentos e, opcionalmente, seções.
@@ -234,7 +239,12 @@ def run_pass(
     Nunca levanta por causa do LLM. Se o provider estiver fora, devolve o que
     conseguiu e reporta `skipped`, deixando o enriquecimento pendente para uma
     próxima rodada — uma ingestão não deve falhar por causa de um resumo.
+
+    `regenerate` refaz o resumo dos documentos de `doc_ids`, mesmo já tendo um. O
+    antigo só é substituído quando o novo é gerado.
     """
+    if regenerate and not doc_ids:
+        raise ValueError("Refazer resumos exige dizer de quais documentos")
     conn = conn or get_conn()
 
     from kb import llm
@@ -242,7 +252,7 @@ def run_pass(
     result: dict[str, Any] = {"documents": 0, "sections": 0, "failed": 0, "skipped": None}
 
     do_sections = ENRICH_SECTIONS if sections is None else sections
-    if not _pending_documents(limit, doc_ids, conn) and not (
+    if not _pending_documents(limit, doc_ids, conn, regenerate) and not (
         do_sections and _pending_sections(limit, doc_ids, conn)
     ):
         return result
@@ -253,7 +263,7 @@ def run_pass(
         return result
 
     try:
-        result["documents"] = _enrich_documents(doc_ids, limit, on_progress, conn, llm, result)
+        result["documents"] = _enrich_documents(doc_ids, limit, on_progress, conn, llm, result, regenerate)
 
         if do_sections:
             result["sections"] = _enrich_sections(doc_ids, limit, on_progress, conn, llm, result)
@@ -273,14 +283,15 @@ def _enrich_documents(
     conn: sqlite3.Connection,
     llm,
     result: dict[str, Any],
+    regenerate: bool = False,
 ) -> int:
-    rows = _pending_documents(limit, doc_ids, conn)
+    rows = _pending_documents(limit, doc_ids, conn, regenerate)
     done = 0
 
     for index, row in enumerate(rows, start=1):
         prompt = DOCUMENT_PROMPT.format(
             outline=_outline_text(row["doc_id"], conn),
-            sample=_document_sample(row["doc_id"], conn),
+            sample=document_sample(row["doc_id"], conn),
         )
 
         try:

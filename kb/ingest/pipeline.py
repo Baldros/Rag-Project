@@ -29,6 +29,7 @@ from kb.quality import decode_quality
 from kb.db import get_conn, transaction
 from kb.ingest.embed import embed_pending
 from kb.ingest.parse import (
+    correct_formulas,
     export_markdown,
     is_parsed,
     parse_document,
@@ -110,12 +111,16 @@ def persist_segments(
     title: str | None = None,
     conn: sqlite3.Connection | None = None,
     manifest: dict | None = None,
+    keep_summary: bool = False,
 ) -> None:
     """
     Grava sections e chunks numa transação só.
 
     Apaga o que existia antes do mesmo documento: re-segmentar é uma operação
     de substituição, não de acúmulo. Os triggers do FTS5 acompanham.
+
+    `keep_summary` mantém o resumo do documento mesmo com o texto alterado: quem
+    chama decidiu que a mudança não o invalida.
     """
     conn = conn or get_conn()
 
@@ -174,7 +179,7 @@ def persist_segments(
             if prior:
                 conn.execute("UPDATE sections SET summary = ?, enriched_at = ? WHERE section_id = ?",
                              (*prior, section.section_id))
-        if changed:
+        if changed and not keep_summary:
             conn.execute("UPDATE documents SET summary = NULL, key_topics = NULL, enriched_at = NULL WHERE doc_id = ?", (doc_id,))
         if manifest:
             conn.execute("UPDATE documents SET artifact_manifest = ?, quality_json = ?, filename = ?, source_path = ?, n_pages = ? WHERE doc_id = ?",
@@ -355,6 +360,59 @@ def ingest_paths(
     result["timings"]["total"] = round(time.monotonic() - started, 3)
     checkpoint()
     return result
+
+
+def apply_formula_corrections(
+    doc_id: str,
+    changes: list[dict],
+    on_progress: ProgressFn | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """
+    Publica LaTeX corrigido à mão e refaz o que deriva dele.
+
+    Roda sobre o tokenizer e o embedder que a ativação deixou carregados. O resumo
+    fica como está, e `summary_affected` diz se o trecho que ele leu mudou. Vale
+    repetir depois de uma falha: correção já publicada não é conflito, e os vetores
+    pendentes são retomados.
+    """
+    from kb.enrich import document_sample
+
+    conn = conn or get_conn()
+    started = time.monotonic()
+    row = conn.execute("SELECT filename, artifact_manifest FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+    if not row or not row["artifact_manifest"]:
+        raise ValueError(f"Documento sem artefatos publicados: {doc_id}")
+    manifest = read_manifest(doc_id, row["artifact_manifest"])
+
+    def progress(phase: str, done: int, total: int, message: str) -> None:
+        if on_progress:
+            on_progress(phase, done, total, message)
+
+    progress("segment", 0, 1, f"{row['filename']}: aplicando correções")
+    updated, applied, rejected = correct_formulas(doc_id, manifest, changes)
+    summary_affected = False
+    if updated is not manifest:
+        sample = document_sample(doc_id, conn)
+        sections, chunks = segment_document(doc_id, updated)
+        if not chunks:
+            raise RuntimeError("as correções não produziram nenhum chunk")
+        export_markdown(doc_id, updated)
+        persist_segments(doc_id, sections, chunks, conn=conn, manifest=updated, keep_summary=True)
+        try:
+            activate_manifest(doc_id, updated)
+        except OSError:
+            logger.exception("Não foi possível atualizar o atalho do manifest; a geração está no SQLite")
+        summary_affected = document_sample(doc_id, conn) != sample
+    progress("segment", 1, 1, f"{row['filename']}: correções aplicadas")
+    embedded = embed_pending(
+        doc_ids=[doc_id],
+        on_progress=lambda done, total, msg: progress("embed", done, total, msg),
+        conn=conn, unload_when_done=False,
+    )
+    return {"doc_id": doc_id, "filename": row["filename"], "applied": applied, "rejected": rejected,
+            "summary_affected": summary_affected, "n_embedded": embedded, "quality": updated["quality"],
+            "manifest": updated["manifest_file"], "timings": {"total": round(time.monotonic() - started, 3)}}
 
 
 def pending_work(result: dict, conn: sqlite3.Connection) -> list[dict]:

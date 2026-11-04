@@ -22,6 +22,8 @@ ProgressFn = Callable[[int, int, str], None]
 _converter: Any = None
 _converter_ocr: str | None = None
 _formula_model: Any = None
+# A corrected formula must still sit where the person saw it after a new conversion.
+MIN_CORRECTION_OVERLAP = 0.5
 
 
 class ParseError(RuntimeError):
@@ -116,6 +118,8 @@ def _write_manifest(doc_id: str, manifest: dict) -> None:
 def activate_manifest(doc_id: str, manifest: dict) -> None:
     # SQLite stores the authoritative generation. This pointer is for inspection.
     _atomic_json(manifest_path(doc_id), manifest)
+    # A retry reuses the candidate's verdict on each block, so it must follow what was published.
+    _atomic_json(_path(doc_id, "candidate.json"), manifest)
 
 
 def _block_ranges(n_pages: int, block_size: int) -> list[tuple[int, int]]:
@@ -244,18 +248,156 @@ def _enrich_existing(document, source: bytes, converter, refs: set[str] | None =
         inp.release()
 
 
-def _quality(document, errors: list[str]) -> dict:
+def _location(item) -> tuple[int, list[float]]:
+    prov = item.prov[0]
+    return prov.page_no, [prov.bbox.l, prov.bbox.t, prov.bbox.r, prov.bbox.b]
+
+
+def _overlap(a: list[float], b: list[float]) -> float:
+    """Intersection over union of two boxes sharing a coordinate origin."""
+    width = min(max(a[0], a[2]), max(b[0], b[2])) - max(min(a[0], a[2]), min(b[0], b[2]))
+    height = min(max(a[1], a[3]), max(b[1], b[3])) - max(min(a[1], a[3]), min(b[1], b[3]))
+    if width <= 0 or height <= 0:
+        return 0.0
+    shared = width * height
+    return shared / (abs(a[2] - a[0]) * abs(a[3] - a[1]) + abs(b[2] - b[0]) * abs(b[3] - b[1]) - shared)
+
+
+def _block_corrections(corrections: list[dict], start: int, end: int) -> list[dict]:
+    return [c for c in corrections if start <= c["page"] <= end]
+
+
+def _overlay_corrections(document, corrections: list[dict]) -> tuple[set[str], list[dict]]:
+    """Put manual LaTeX on a loaded block. The block file keeps what the model wrote.
+
+    A correction whose formula is no longer in place is returned instead of being
+    written over a different formula.
+    """
+    if not corrections:
+        return set(), []
+    formulas = {item.self_ref: item for item in _formulas(document)}
+    corrected: set[str] = set()
+    orphaned: list[dict] = []
+    for correction in corrections:
+        item = formulas.get(correction["ref"])
+        if item is not None:
+            page, box = _location(item)
+            if page == correction["page"] and _overlap(box, correction["bbox"]) >= MIN_CORRECTION_OVERLAP:
+                item.text = correction["text"]
+                corrected.add(item.self_ref)
+                continue
+        orphaned.append(correction)
+    return corrected, orphaned
+
+
+def _quality(document, errors: list[str], corrected: set[str] | None = None,
+             orphaned: list[dict] | None = None) -> dict:
     formulas = _formulas(document)
+    corrected = corrected or set()
+    # A person checked a corrected formula, so the automatic rule no longer judges it.
     issues = [{"code": "FORMULA_EXTRACTION", "ref": item.self_ref,
                "pages": sorted({p.page_no for p in item.prov}),
                "message": _formula_problem(item)}
-              for item in formulas if _formula_problem(item)]
+              for item in formulas if item.self_ref not in corrected and _formula_problem(item)]
+    issues += [{"code": "FORMULA_CORRECTION_ORPHANED", "pages": [c["page"]],
+                "message": f"Correção manual não reaplicada: a fórmula mudou em uma nova conversão. LaTeX guardado: {c['text']}"}
+               for c in orphaned or []]
     return {"status": "partial" if issues or errors else "complete",
             "formula_count": len(formulas), "formula_missing": sum(_missing(i) for i in formulas),
-            "formula_flagged": len(issues), "formula_verification": "automated_unverified" if formulas else "not_applicable",
+            "formula_flagged": len(issues), "formula_corrected": len(corrected),
+            "formula_verification": "automated_unverified" if formulas else "not_applicable",
             "issues": issues, "errors": errors,
             "warnings": (["Há fórmulas ausentes ou cuja extração falhou."] if issues or errors else []) +
                         (["Fórmulas transcritas por modelo local; a correção matemática não foi verificada."] if formulas else [])}
+
+
+def _aggregate_quality(manifest: dict) -> dict:
+    qualities = [b.get("quality", {}) for b in manifest["blocks"]]
+    quality = {
+        "status": "complete" if manifest["complete"] and all(q.get("status") == "complete" for q in qualities) else "partial",
+        "formula_count": sum(q.get("formula_count", 0) for q in qualities),
+        "formula_missing": sum(q.get("formula_missing", 0) for q in qualities),
+        "formula_flagged": sum(q.get("formula_flagged", 0) for q in qualities),
+        "formula_corrected": sum(q.get("formula_corrected", 0) for q in qualities),
+        "formula_verification": "automated_unverified" if any(q.get("formula_count", 0) for q in qualities) else "not_applicable",
+        "issues": [{**i, "block": b["file"]} for b in manifest["blocks"] for i in b.get("quality", {}).get("issues", [])],
+        "errors": [e for q in qualities for e in q.get("errors", [])],
+        "warnings": [],
+    }
+    if quality["status"] != "complete":
+        quality["warnings"] = ["Há falhas de conversão ou fórmulas ausentes; consulte os detalhes de qualidade."]
+    if quality["formula_count"]:
+        quality["warnings"].append("Fórmulas transcritas por modelo local; a correção matemática não foi verificada.")
+    return quality
+
+
+def correct_formulas(doc_id: str, manifest: dict, changes: list[dict]) -> tuple[dict, list[dict], list[dict]]:
+    """Return a manifest with the manual LaTeX, plus the applied and the rejected changes.
+
+    Each change has `ref`, `page`, `text` (None restores the model's output) and
+    `expected`, the LaTeX the person was looking at. The new generation reuses the
+    block files, so their hashes stay valid, and takes effect only when the caller
+    publishes it together with its chunks. With nothing to change, `manifest` itself
+    comes back: applying the same text twice is not a conflict.
+    """
+    from docling_core.types.doc import DoclingDocument
+
+    if not validate_manifest(doc_id, manifest):
+        raise RuntimeError("Artefato incompleto, ausente ou corrompido; execute novamente a ingestão")
+    corrections = {(c["page"], c["ref"]): c for c in manifest.get("corrections") or []}
+    applied: list[dict] = []
+    rejected: list[dict] = []
+    touched: set[int] = set()
+    for change in changes:
+        page, ref, text = change["page"], change["ref"], change.get("text")
+        prior = corrections.get((page, ref))
+        index = next((i for i, b in enumerate(manifest["blocks"]) if b["page_start"] <= page <= b["page_end"]), None)
+        if index is None:
+            rejected.append({**change, "reason": f"A página {page} não existe neste documento."})
+            continue
+        if text is None:
+            if prior is None:
+                rejected.append({**change, "reason": "Esta fórmula não tem correção para restaurar."})
+                continue
+            del corrections[(page, ref)]
+            touched.add(index)
+            applied.append(change)
+            continue
+        if not text.strip():
+            rejected.append({**change, "reason": "O LaTeX está vazio."})
+            continue
+        document = DoclingDocument.load_from_json(_path(doc_id, manifest["blocks"][index]["file"]))
+        item = next((i for i in _formulas(document) if i.self_ref == ref), None)
+        if item is None or _location(item)[0] != page:
+            rejected.append({**change, "reason": "Esta fórmula não existe mais neste documento."})
+            continue
+        current = prior["text"] if prior else item.text
+        if text == current:
+            applied.append(change)
+            continue
+        if change.get("expected") != current:
+            rejected.append({**change, "reason": "A fórmula mudou depois da edição; abra de novo e revise."})
+            continue
+        corrections[(page, ref)] = {"page": page, "ref": ref, "bbox": _location(item)[1], "original": item.text,
+                                    "text": text, "corrected_at": datetime.now(timezone.utc).isoformat()}
+        touched.add(index)
+        applied.append(change)
+    if not touched:
+        return manifest, applied, rejected
+
+    current_corrections = list(corrections.values())
+    blocks = [dict(block) for block in manifest["blocks"]]
+    for index in touched:
+        block = blocks[index]
+        document = DoclingDocument.load_from_json(_path(doc_id, block["file"]))
+        corrected, orphaned = _overlay_corrections(
+            document, _block_corrections(current_corrections, block["page_start"], block["page_end"]))
+        block["quality"] = _quality(document, block.get("quality", {}).get("errors", []), corrected, orphaned)
+    updated = {**manifest, "manifest_file": f"generations/{uuid.uuid4().hex}/manifest.json", "blocks": blocks,
+               "corrections": current_corrections}
+    updated["quality"] = _aggregate_quality(updated)
+    _atomic_json(_path(doc_id, updated["manifest_file"]), updated)
+    return updated, applied, rejected
 
 
 def parse_document(pdf_path: Path | str, doc_id: str | None = None,
@@ -283,6 +425,10 @@ def parse_document(pdf_path: Path | str, doc_id: str | None = None,
                 "manifest_file": f"{generation}/manifest.json", "n_pages": n_pages,
                 "block_size": PAGE_BLOCK_SIZE, "blocks": [], "complete": False,
                 "started_at": datetime.now(timezone.utc).isoformat()}
+    # Corrections come from the published manifest and outlive any new conversion, even with `force`.
+    corrections = (previous or {}).get("corrections") or []
+    if corrections:
+        manifest["corrections"] = corrections
     source = pdf_path.read_bytes()  # Unicode paths never reach a native PDF backend.
     started = time.monotonic()
     from docling.datamodel.base_models import DocumentStream, ConversionStatus
@@ -310,7 +456,7 @@ def parse_document(pdf_path: Path | str, doc_id: str | None = None,
                 document = DoclingDocument.load_from_json(_path(doc_id, old["file"]))
                 refs = (None if old.get("formula_version") != formulas_version or
                         old.get("quality", {}).get("errors") else
-                        {i["ref"] for i in old.get("quality", {}).get("issues", [])})
+                        {i["ref"] for i in old.get("quality", {}).get("issues", []) if i.get("ref")})
                 try:
                     errors = _enrich_existing(document, source, converter, refs)
                 except Exception as exc:
@@ -340,12 +486,14 @@ def parse_document(pdf_path: Path | str, doc_id: str | None = None,
                     entry["formula_retried"] = True
             if set(document.pages) != set(range(start, end + 1)):
                 raise RuntimeError(f"Cobertura de páginas inválida: esperado {start}-{end}, obtido {sorted(document.pages)}")
-            entry["quality"] = _quality(document, errors)
             target = _path(doc_id, entry["file"])
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_suffix(".json.tmp")
             document.save_as_json(tmp)
             tmp.replace(target)
+            # After saving, so the block keeps what the model wrote.
+            corrected, orphaned = _overlay_corrections(document, _block_corrections(corrections, start, end))
+            entry["quality"] = _quality(document, errors, corrected, orphaned)
             entry.update(ok=True, sha256=file_sha256(target))
         except Exception as exc:
             entry["error"] = str(exc)
@@ -360,21 +508,7 @@ def parse_document(pdf_path: Path | str, doc_id: str | None = None,
     manifest["n_blocks_ok"] = sum(bool(b.get("ok")) for b in manifest["blocks"])
     manifest["n_blocks_failed"] = len(ranges) - manifest["n_blocks_ok"]
     manifest["complete"] = bool(ranges) and manifest["n_blocks_failed"] == 0
-    qualities = [b.get("quality", {}) for b in manifest["blocks"]]
-    manifest["quality"] = {
-        "status": "complete" if manifest["complete"] and all(q.get("status") == "complete" for q in qualities) else "partial",
-        "formula_count": sum(q.get("formula_count", 0) for q in qualities),
-        "formula_missing": sum(q.get("formula_missing", 0) for q in qualities),
-        "formula_flagged": sum(q.get("formula_flagged", 0) for q in qualities),
-        "formula_verification": "automated_unverified" if any(q.get("formula_count", 0) for q in qualities) else "not_applicable",
-        "issues": [{**i, "block": b["file"]} for b in manifest["blocks"] for i in b.get("quality", {}).get("issues", [])],
-        "errors": [e for q in qualities for e in q.get("errors", [])],
-        "warnings": [],
-    }
-    if manifest["quality"]["status"] != "complete":
-        manifest["quality"]["warnings"] = ["Há falhas de conversão ou fórmulas ausentes; consulte os detalhes de qualidade."]
-    if manifest["quality"]["formula_count"]:
-        manifest["quality"]["warnings"].append("Fórmulas transcritas por modelo local; a correção matemática não foi verificada.")
+    manifest["quality"] = _aggregate_quality(manifest)
     manifest["elapsed_seconds"] = round(time.monotonic() - started, 3)
     manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
     _write_manifest(doc_id, manifest)
@@ -388,8 +522,11 @@ def iter_blocks(doc_id: str, manifest: dict | None = None) -> Iterator[tuple[int
     manifest = manifest if manifest is not None else read_manifest(doc_id)
     if not validate_manifest(doc_id, manifest):
         raise RuntimeError("Artefato incompleto, ausente ou corrompido; execute novamente a ingestão")
+    corrections = manifest.get("corrections") or []
     for block in manifest["blocks"]:
-        yield block["page_start"], block["page_end"], DoclingDocument.load_from_json(_path(doc_id, block["file"]))
+        document = DoclingDocument.load_from_json(_path(doc_id, block["file"]))
+        _overlay_corrections(document, _block_corrections(corrections, block["page_start"], block["page_end"]))
+        yield block["page_start"], block["page_end"], document
 
 
 def export_markdown(doc_id: str, manifest: dict | None = None) -> Path:

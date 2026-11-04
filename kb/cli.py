@@ -94,6 +94,18 @@ def _wait_job(job_id: str) -> dict[str, Any]:
         time.sleep(0.5)
 
 
+def _read_formula_changes(path: str) -> list[dict[str, Any]]:
+    """LaTeX travels in a file: `\\`, `&`, `%` and quotes do not survive a command line."""
+    with open(path, encoding="utf-8") as file:
+        changes = json.load(file)
+    if not isinstance(changes, list) or not changes or not all(
+        isinstance(change, dict) and isinstance(change.get("ref"), str) and isinstance(change.get("page"), int)
+        and isinstance(change.get("text"), (str, type(None))) for change in changes
+    ):
+        raise ValueError("O arquivo deve ter uma lista de correções com ref, page e text")
+    return changes
+
+
 def _run(args: argparse.Namespace) -> Any:
     from kb import session
 
@@ -123,6 +135,13 @@ def _run(args: argparse.Namespace) -> Any:
             {"collection": args.collection, "reset": args.reset}
         )
         result = session.call("ingestion", cmd, **payload)
+        return result if args.background else _wait_job(result["job_id"])
+    if cmd == "formulas":
+        result = session.call("ingestion", "formulas", doc_id=args.doc_id,
+                              changes=_read_formula_changes(args.file))
+        return result if args.background else _wait_job(result["job_id"])
+    if cmd == "summarize":
+        result = session.call("ingestion", "summary", doc_id=args.doc_id)
         return result if args.background else _wait_job(result["job_id"])
 
     if cmd == "fetch":
@@ -278,6 +297,16 @@ def build_parser() -> JsonParser:
                    help="invalida os vetores existentes antes de reembedar")
     p.add_argument("--background", action="store_true",
                    help="devolve job_id em vez de aguardar o fim")
+    p = sub.add_parser("formulas", help="corrige à mão o LaTeX de fórmulas")
+    actions = p.add_subparsers(dest="action", required=True, parser_class=JsonParser)
+    item = actions.add_parser("apply", help="aplica correções em modo ingestion e refaz chunks e vetores do documento")
+    item.add_argument("--doc-id", required=True, metavar="ID", help="documento a corrigir")
+    item.add_argument("--file", required=True, metavar="ARQUIVO",
+                      help="JSON com a lista de correções: ref, page, expected e text (null restaura o original)")
+    item.add_argument("--background", action="store_true", help="retorna o job_id sem esperar o fim")
+    p = sub.add_parser("summarize", help="refaz o resumo de um documento em modo ingestion")
+    p.add_argument("--doc-id", required=True, metavar="ID", help="documento a resumir")
+    p.add_argument("--background", action="store_true", help="retorna o job_id sem esperar o fim")
     p = sub.add_parser("fetch", help="lê seção ou páginas")
     p.add_argument("--section-id", metavar="ID", help="id de seção devolvido numa citação")
     p.add_argument("--doc-id", metavar="ID", help="documento a ler por páginas")
